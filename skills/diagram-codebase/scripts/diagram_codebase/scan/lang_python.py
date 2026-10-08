@@ -54,6 +54,8 @@ class PyFile:
         default_factory=list
     )  # (target, value, line, caller)
     env_reads: list[tuple[str, int, str]] = field(default_factory=list)  # (VAR, line, caller)
+    # Module-level `name = Ctor(...)` / annotated names -> constructor or annotation text.
+    module_types: dict[str, str] = field(default_factory=dict)
 
 
 def literal(node: ast.AST | None) -> Any:
@@ -81,7 +83,9 @@ def literal(node: ast.AST | None) -> Any:
     if isinstance(node, ast.Dict):
         return {
             "dict": {
-                str(literal(k)): literal(v) for k, v in zip(node.keys, node.values) if k is not None
+                str(literal(k)): literal(v)
+                for k, v in zip(node.keys, node.values, strict=True)
+                if k is not None
             }
         }
     if isinstance(node, ast.Call):
@@ -160,7 +164,9 @@ class _Visitor(ast.NodeVisitor):
                     description=doc.split("\n\n")[0][:300], symbols=[qual],
                     bases=[dotted(bs) for bs in node.bases], file=self.pf.path)  # fmt: skip
         self.scope.append(("class", qual))
+        self.local_types.append({})  # class-body names are not module-level instances
         self.generic_visit(node)
+        self.local_types.pop()
         self.scope.pop()
 
     def _visit_func(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
@@ -197,10 +203,10 @@ class _Visitor(ast.NodeVisitor):
         self.pf.decorators[fid] = decos
         self.scope.append(("function", qual))
         # Annotated parameters give receiver types (dependency-injection style).
+        # Unannotated parameters map to "" so they shadow module-level names.
         hinted = {}
         for a in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]:
-            if a.annotation is not None and isinstance(a.annotation, (ast.Name, ast.Attribute)):
-                hinted[a.arg] = dotted(a.annotation)
+            hinted[a.arg] = _annotation_text(a.annotation)
         self.local_types.append(hinted)
         self.generic_visit(node)
         self.local_types.pop()
@@ -251,14 +257,18 @@ class _Visitor(ast.NodeVisitor):
             self.local_types[-1].setdefault(name, type_text)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if isinstance(node.annotation, (ast.Name, ast.Attribute)):
-            name = dotted(node.target)
-            if name:
-                self._record_attr_type(name, dotted(node.annotation))
+        text = _annotation_text(node.annotation)
+        name = dotted(node.target)
+        if text and name:
+            if self.scope and self.scope[-1][0] == "class" and isinstance(node.target, ast.Name):
+                # Class-body annotation (`engine: Engine`) declares an instance attribute type.
+                self.pf.classes[self.scope[-1][1]]["attr_types"].setdefault(name, text)
+            else:
+                self._record_attr_type(name, text)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        if isinstance(node.value, ast.Name) and node.value.id in self.local_types[-1]:
+        if isinstance(node.value, ast.Name) and self.local_types[-1].get(node.value.id):
             for tgt in node.targets:
                 name = dotted(tgt)
                 if name.startswith("self."):
@@ -268,6 +278,11 @@ class _Visitor(ast.NodeVisitor):
                 name = dotted(tgt)
                 if name:
                     self.pf.str_assigns.append((name, node.value.value, node.lineno, self.caller))
+        if not isinstance(node.value, ast.Call):
+            # Rebinding a plain name hides any module-level instance of the same name.
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    self.local_types[-1].setdefault(tgt.id, "")
         if isinstance(node.value, ast.Call):
             func = dotted(node.value.func)
             for tgt in node.targets:
@@ -324,19 +339,50 @@ class _Visitor(ast.NodeVisitor):
 class PyIndex:
     files: dict[str, PyFile]
     by_module: dict[str, PyFile]
+    builder: ModelBuilder | None = None
 
-    def resolve_callable(self, pf: PyFile, value: Any, class_scope: str | None) -> str | None:
-        """Resolve a callback argument (e.g. `self.on_scan`, `handler`) to a function id."""
+    def resolve_callable(
+        self,
+        pf: PyFile,
+        value: Any,
+        class_scope: str | None,
+        local_types: dict[str, str] | None = None,
+    ) -> str | None:
+        """Resolve a callback argument (e.g. `self.on_scan`, `handler`, `worker.run`) to a function id.
+
+        `local_types` (variable -> constructor/annotation text, as recorded on a
+        CallRecord) lets `obj.method` resolve when `obj` has a known class.
+        """
         if isinstance(value, dict) and "name" in value:
             text = value["name"]
         elif isinstance(value, dict) and value.get("call") == "partial" and value.get("args"):
-            return self.resolve_callable(pf, value["args"][0], class_scope)
+            return self.resolve_callable(pf, value["args"][0], class_scope, local_types)
         else:
             return None
-        if text.startswith("self.") and class_scope and "." not in text[5:]:
-            return _method_of(pf.classes[class_scope]["id"], text[5:], self.by_module)
+        if not isinstance(text, str) or not text:
+            return None
+        if text.startswith("self.") and class_scope:
+            rest = text[5:]
+            if "." not in rest:
+                return _method_of(pf.classes[class_scope]["id"], rest, self.by_module)
+            attr, _, meth = rest.partition(".")
+            if "." in meth or self.builder is None:
+                return None
+            typ = _type_of(
+                pf.classes[class_scope]["attr_types"].get(attr), pf, self.by_module, self.builder
+            )
+            return _method_of(typ, meth, self.by_module) if typ else None
+        head, _, meth = text.rpartition(".")
+        if head and self.builder is not None:
+            typ = _receiver_type(head, pf, local_types or {}, self.by_module, self.builder)
+            if typ:
+                return _method_of(typ, meth, self.by_module)
         target = _resolve_name(text, pf, self.by_module)
         return target if target and target.startswith("fn:") else None
+
+    def resolve_class(self, pf: PyFile, text: str) -> str | None:
+        target = _resolve_name(text, pf, self.by_module)
+        return target if target and target.startswith("cls:") else None
 
 
 def analyze_python(root: Path, files: list[dict[str, Any]], b: ModelBuilder) -> PyIndex:
@@ -370,7 +416,9 @@ def analyze_python(root: Path, files: list[dict[str, Any]], b: ModelBuilder) -> 
         b.node(pf.module_id, pf.module, "module", evidence_ids=[ev], description=(doc or "").split("\n\n")[0][:300],
                file=pf.path, language="python", parse_error=pf.error)  # fmt: skip
         if pf.tree is not None:
-            _Visitor(pf, b).visit(pf.tree)
+            visitor = _Visitor(pf, b)
+            visitor.visit(pf.tree)
+            pf.module_types = {k: v for k, v in visitor.local_types[0].items() if v}
 
     for pf in pyfiles.values():
         if pf.tree is None:
@@ -383,7 +431,7 @@ def analyze_python(root: Path, files: list[dict[str, Any]], b: ModelBuilder) -> 
                 set(b.nodes[pf.module_id]["tags"]) | {"entrypoint"}
             )
             b.nodes[pf.module_id]["metadata"]["main_block"] = list(pf.main_block)
-    return PyIndex(pyfiles, by_module)
+    return PyIndex(pyfiles, by_module, b)
 
 
 def _lookup_module(name: str, by_module: dict[str, PyFile]) -> tuple[PyFile | None, str]:
@@ -491,8 +539,40 @@ def _type_of(
         owner_path = target.split(":", 2)[1]
         owner = next((p for p in by_module.values() if p.path == owner_path), None)
         if outs and owner is not None:
-            target = _resolve_name(outs[0], owner, by_module)
+            target = _resolve_name(outs[0].strip("'\""), owner, by_module)
     return target if target and target.startswith("cls:") else None
+
+
+def _annotation_text(ann: ast.AST | None) -> str:
+    """`Foo`, `mod.Foo` or the forward reference `"Foo"`; anything else is ""."""
+    if isinstance(ann, (ast.Name, ast.Attribute)):
+        return dotted(ann)
+    if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+        text = ann.value.strip()
+        return text if text.replace(".", "").replace("_", "").isalnum() else ""
+    return ""
+
+
+def _receiver_type(
+    head: str,
+    pf: PyFile,
+    local_types: dict[str, str],
+    by_module: dict[str, PyFile],
+    b: ModelBuilder,
+) -> str | None:
+    """Class id of a plain-name receiver: local/param type, module instance, or imported instance."""
+    if "." in head:
+        return None
+    if head in local_types:  # locals (incl. untyped params) shadow module names
+        return _type_of(local_types[head], pf, by_module, b)
+    if head in pf.module_types:
+        return _type_of(pf.module_types[head], pf, by_module, b)
+    target = pf.imports.get(head)
+    if target:
+        mod, rest = _lookup_module(target, by_module)
+        if mod is not None and rest and "." not in rest and rest in mod.module_types:
+            return _type_of(mod.module_types[rest], mod, by_module, b)
+    return None
 
 
 def _resolve_calls(pf: PyFile, by_module: dict[str, PyFile], b: ModelBuilder) -> None:
@@ -521,8 +601,8 @@ def _resolve_calls(pf: PyFile, by_module: dict[str, PyFile], b: ModelBuilder) ->
             continue
         else:
             head, _, meth = func.rpartition(".")
-            if head and head in local_types and "." not in meth:
-                typ = _type_of(local_types[head], pf, by_module, b)
+            if head:
+                typ = _receiver_type(head, pf, local_types, by_module, b)
                 if typ:
                     rec.receiver_type = typ
                     target = _method_of(typ, meth, by_module)

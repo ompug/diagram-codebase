@@ -41,6 +41,18 @@ VERBS = {
 }  # fmt: skip
 ASYNC_KINDS = {"publishes", "subscribes", "spawns", "triggers", "external_call"}
 
+SHAPE_BY_KIND = {
+    "datastore": "cylinder", "db_entity": "cylinder", "event_channel": "lean_r", "topic": "lean_r",
+    "ros_service": "hexagon", "ros_action": "hexagon", "api_endpoint": "stadium",
+    "algorithm": "subroutine", "data_artifact": "lean_r", "config": "odd",
+    "deployment_unit": "rounded", "ros_node": "rounded", "subsystem": "rounded", "tf_frame": "circle",
+}  # fmt: skip
+# Kinds drawn individually at symbol level (functions, classes and runnable things).
+SYMBOL_KINDS = {
+    "function", "class", "api_endpoint", "ros_node", "service", "worker", "algorithm",
+    "ui_component", "state", "data_artifact",
+}  # fmt: skip
+
 
 class ModelView:
     def __init__(self, model: dict[str, Any]) -> None:
@@ -58,9 +70,15 @@ class ModelView:
             if n.get("parent"):
                 self.children[n["parent"]].append(n["id"])
         self._handler_of: dict[str, str] = {}
-        for e in self.edges:
+        for e in sorted(self.edges, key=lambda e: e["id"]):
             if e["kind"] == "handles":
                 self._handler_of.setdefault(e["from"], e["to"])
+        self.evidence: dict[str, dict] = {ev["id"]: ev for ev in model.get("evidence", [])}
+        self.by_subsystem: dict[str, list[str]] = defaultdict(list)
+        for n in model["nodes"]:
+            if n.get("subsystem"):
+                self.by_subsystem[n["subsystem"]].append(n["id"])
+        self._module_labels = _module_labels([n for n in model["nodes"] if n["kind"] == "module"])
 
     # ------------------------------------------------------------ structure
     def module_of(self, nid: str) -> str:
@@ -105,16 +123,68 @@ class ModelView:
             return self.module_of(nid)
         return nid
 
+    def handler_of(self, endpoint: str) -> str | None:
+        return self._handler_of.get(endpoint)
+
     def label(self, uid: str) -> str:
+        """Readable label: modules by basename (parent dir added when ambiguous),
+        functions by qualname, everything else by name. Never truncated."""
         if uid in self.subsystems:
             return self.subsystems[uid]["name"]
         n = self.nodes.get(uid)
         if n is None:
             return uid
         if n["kind"] == "module":
-            f = n.get("metadata", {}).get("file") or n["name"]
-            return f.rsplit("/", 1)[-1]
+            return self._module_labels.get(uid, n["name"])
         return n["name"]
+
+    def shape(self, uid: str) -> str:
+        return SHAPE_BY_KIND.get(self.kind_of(uid), "rect")
+
+    def file_of(self, nid: str) -> str:
+        n = self.nodes.get(nid) or {}
+        f = n.get("metadata", {}).get("file")
+        if f:
+            return f
+        if nid.startswith(("mod:", "fn:", "cls:")):
+            return nid.split(":", 2)[1]
+        return ""
+
+    def edge_position(self, e: dict[str, Any]) -> tuple[str, int, str]:
+        """Sort key placing an edge at its first evidence location (file, line)."""
+        locs = [
+            (ev.get("file") or "", ev.get("line_start") or 0)
+            for ev in (self.evidence.get(i) for i in e.get("evidence_ids", []))
+            if ev
+        ]
+        file, line = min(locs) if locs else ("", 0)
+        return (file, line, e["id"])
+
+    def members(
+        self,
+        level: str,
+        units: list[str] | set[str],
+        *,
+        scope: set[str] | None = None,
+        unit_override: dict[str, str] | None = None,
+    ) -> dict[str, list[str]]:
+        """Model node ids represented by each unit (the unit itself plus folded nodes)."""
+        wanted = set(units)
+        out: dict[str, set[str]] = {u: ({u} if u in self.nodes else set()) for u in wanted}
+        for nid in sorted(self.nodes if scope is None else scope):
+            if nid not in self.nodes:
+                continue
+            u = (unit_override or {}).get(nid) or self.unit(nid, level)
+            if u in wanted:
+                out[u].add(nid)
+        return {u: sorted(ids) for u, ids in sorted(out.items())}
+
+    def significant_in(self, sid: str, kinds: set[str] | None = None) -> list[str]:
+        return sorted(
+            nid
+            for nid in self.by_subsystem.get(sid, [])
+            if (kinds is None or self.nodes[nid]["kind"] in kinds) and self.is_significant(nid)
+        )
 
     def kind_of(self, uid: str) -> str:
         if uid in self.subsystems:
@@ -154,8 +224,12 @@ class ModelView:
         exclude_kinds: set[str] | None = None,
         imports_fallback: bool = True,
         unit_override: dict[str, str] | None = None,
+        touching: set[str] | None = None,
     ) -> tuple[list[str], list[dict[str, Any]]]:
-        """Map edges onto units. Returns (units, aggregated edges)."""
+        """Map edges onto units. Returns (units, aggregated edges).
+
+        `touching` keeps only edges with at least one endpoint in that node set
+        (used for "inside + 1-hop context" diagrams)."""
         exclude_kinds = set(exclude_kinds or set())
         pairs: dict[tuple[str, str], list[dict]] = defaultdict(list)
         import_pairs: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -165,6 +239,8 @@ class ModelView:
             if kinds is not None and e["kind"] not in kinds:
                 continue
             if e["kind"] in exclude_kinds:
+                continue
+            if touching is not None and e["from"] not in touching and e["to"] not in touching:
                 continue
             if e["kind"] == "handles" and level != "symbol":
                 continue  # endpoint folded into its handler's unit
@@ -223,6 +299,26 @@ def summarize(a: str, b: str, es: list[dict[str, Any]]) -> dict[str, Any]:
             "unknown",
         ),
         "import_only": set(kinds) == {"imports"},
+        "weight": len(es),
         "async": main_kind in ASYNC_KINDS,
         "error": main_kind == "error_path",
     }
+
+
+def _module_labels(modules: list[dict[str, Any]]) -> dict[str, str]:
+    """Basename per module; add parent directories until labels are unique."""
+    paths = {
+        m["id"]: (m.get("metadata", {}).get("file") or m["id"].split(":", 1)[-1]) for m in modules
+    }
+    out: dict[str, str] = {}
+    depth = {mid: 1 for mid in paths}
+    for _ in range(8):
+        labels = {mid: "/".join(p.split("/")[-depth[mid] :]) for mid, p in paths.items()}
+        counts = Counter(labels.values())
+        clash = [mid for mid, lab in labels.items() if counts[lab] > 1]
+        out = labels
+        if not clash:
+            break
+        for mid in clash:
+            depth[mid] += 1
+    return out

@@ -1,0 +1,15 @@
+{
+  "name": "diagram-codebase-mermaid-check",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Optional validator: runs mermaid.parse on generated diagrams (used by CI and parsecheck.py).",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "jsdom": "25.0.1",
+    "mermaid": "11.17.2"
+  }
+}

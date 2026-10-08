@@ -156,6 +156,24 @@ class PyPatterns:
     def _cls_scope(self, rec: CallRecord) -> str | None:
         return rec.__dict__.get("_class_scope")
 
+    def _callable(self, pf: PyFile, value: Any, rec: CallRecord) -> str | None:
+        return self.idx.resolve_callable(
+            pf, value, self._cls_scope(rec), rec.__dict__.get("_local_types")
+        )
+
+    @staticmethod
+    def _callable_status(value: Any, rec: CallRecord) -> str:
+        """`static_inferred` when the callback resolved through a receiver's inferred type."""
+        text = value.get("name") if isinstance(value, dict) else None
+        if not isinstance(text, str):
+            return "confirmed"
+        if text.startswith("self.") and text.count(".") >= 2:
+            return "static_inferred"
+        head = text.split(".", 1)[0]
+        if "." in text and head in rec.__dict__.get("_local_types", {}):
+            return "static_inferred"
+        return "confirmed"
+
     def _resolve_head(self, pf: PyFile, func: str) -> str:
         """Map an alias head to its imported module path: `rq.get` -> `requests.get`."""
         head, _, rest = func.partition(".")
@@ -245,10 +263,7 @@ class PyPatterns:
                     continue
                 handler = None
                 if isinstance(view, dict) and view.get("call", "").endswith("as_view"):
-                    cls = self.idx.resolve_callable(
-                        pf, {"name": view["call"].rsplit(".", 1)[0]}, None
-                    )
-                    handler = cls
+                    handler = self.idx.resolve_class(pf, view["call"].rsplit(".", 1)[0])
                 else:
                     handler = self.idx.resolve_callable(pf, view, None)
                 self.endpoint(
@@ -408,6 +423,33 @@ class PyPatterns:
                 )
                 return
 
+        # OS signal handlers: signal.signal(SIGTERM, h) / loop.add_signal_handler(SIGTERM, h)
+        if (full == "signal.signal" or rec.attr == "add_signal_handler") and len(rec.args) >= 2:
+            sig = rec.args[0]
+            sig_name = (
+                sig["name"].rsplit(".", 1)[-1] if isinstance(sig, dict) and "name" in sig else None
+            )
+            fn = self._callable(pf, rec.args[1], rec)
+            if sig_name and sig_name.startswith("SIG") and fn:
+                ev = self._ev(
+                    pf,
+                    rec.line,
+                    rec.end_line,
+                    symbol=rec.func,
+                    detail=f"{sig_name} handler",
+                    status=self._callable_status(rec.args[1], rec),
+                )
+                chan = self.channel(sig_name, ev, transport="os signal")
+                self.b.edge(
+                    chan,
+                    fn,
+                    "triggers",
+                    evidence_ids=[ev],
+                    label="signal handler",
+                    phase="shutdown" if sig_name in ("SIGINT", "SIGTERM", "SIGQUIT") else "runtime",
+                )
+            return
+
         # spawn threads / tasks / processes
         spawn_kind = SPAWN_FUNCS.get(full) or SPAWN_FUNCS.get(rec.func)
         target_val = rec.kwargs.get("target") if spawn_kind else None
@@ -420,10 +462,15 @@ class PyPatterns:
                 {"name": first["call"]} if isinstance(first, dict) and "call" in first else first
             )
         if spawn_kind and target_val is not None:
-            fn = self.idx.resolve_callable(pf, target_val, cls_scope)
+            fn = self._callable(pf, target_val, rec)
             if fn:
                 ev = self._ev(
-                    pf, rec.line, rec.end_line, symbol=rec.func, detail=f"spawns {spawn_kind}"
+                    pf,
+                    rec.line,
+                    rec.end_line,
+                    symbol=rec.func,
+                    detail=f"spawns {spawn_kind}",
+                    status=self._callable_status(target_val, rec),
                 )
                 self.b.edge(
                     rec.caller, fn, "spawns", evidence_ids=[ev], label=spawn_kind, phase="runtime"
@@ -438,7 +485,7 @@ class PyPatterns:
                 name = _first_str(rec.args, {})
                 task_name = name or "task"
             else:
-                fn = self.idx.resolve_callable(pf, {"name": rec.func.rsplit(".", 1)[0]}, cls_scope)
+                fn = self._callable(pf, {"name": rec.func.rsplit(".", 1)[0]}, rec)
                 task_name = rec.func.rsplit(".", 1)[0].split(".")[-1]
             ev = self._ev(pf, rec.line, rec.end_line, symbol=rec.func, detail="task dispatch")
             chan = self.channel("task queue", ev, transport="celery")
@@ -501,7 +548,16 @@ class PyPatterns:
                     or rec.kwargs.get("on_message_callback")
                     or rec.kwargs.get("handler")
                 )
-                fn = self.idx.resolve_callable(pf, cb, cls_scope) if cb is not None else None
+                fn = self._callable(pf, cb, rec) if cb is not None else None
+                if fn and self._callable_status(cb, rec) != "confirmed":
+                    ev = self._ev(
+                        pf,
+                        rec.line,
+                        rec.end_line,
+                        symbol=rec.func,
+                        detail=f"{rec.attr} '{name}' (handler type inferred)",
+                        status="static_inferred",
+                    )
                 self.b.edge(
                     chan,
                     fn or rec.caller,
@@ -536,13 +592,16 @@ class PyPatterns:
                 "SimpleQueue",
                 "JoinableQueue",
             ):
-                qname = recv.split(".")[-1]
+                # Qualify by owning class (self.queue) or module (module-level queue) so two
+                # unrelated `queue` attributes never collapse into one channel.
+                if recv.startswith("self.") and cls_scope:
+                    qname = f"{cls_scope}.{recv[5:]}"
+                else:
+                    qname = f"{pf.module}.{recv}"
                 ev = self._ev(
                     pf, rec.line, rec.end_line, symbol=rec.func, detail=f"queue {rec.attr}"
                 )
-                chan = self.channel(
-                    f"{qname} ({ctor.split('.')[0]})" if "." in ctor else qname, ev, transport=ctor
-                )
+                chan = self.channel(qname, ev, transport=ctor)
                 if rec.attr.startswith("put"):
                     self.b.edge(
                         rec.caller,
@@ -561,16 +620,20 @@ class PyPatterns:
                         label="dequeue",
                         phase="runtime",
                     )
-            return
+                return  # only a recognized queue consumes the call; `requests.get` falls through
 
         # ORM session operations: db.query(Model), session.add(obj), session.commit()
         recv = rec.func.rsplit(".", 1)[0] if "." in rec.func else ""
         if recv.split(".")[-1] in SESSION_NAMES and (rec.attr in ORM_READ or rec.attr in ORM_WRITE):
             tables = []
+            local_types = rec.__dict__.get("_local_types", {})
             for a in rec.args:
                 if isinstance(a, dict) and "name" in a:
-                    t = self._table_for_class(a["name"].split(".")[-1])
-                    if t:
+                    # db.query(models.Todo) names the class; db.add(todo) names a
+                    # variable whose constructor (todo = models.Todo(...)) we recorded.
+                    cls_text = local_types.get(a["name"], a["name"])
+                    t = self._table_for_class(cls_text.split(".")[-1])
+                    if t and t not in tables:
                         tables.append(t)
             ev = self._ev(pf, rec.line, rec.end_line, symbol=rec.func, detail=f"ORM {rec.attr}")
             store = (
@@ -706,18 +769,21 @@ def _orm_attr(name: str, call: ast.Call, annotation: str = "") -> dict[str, Any]
     typ = annotation
     key = ""
     ref = None
-    for a in call.args:
-        text = dotted(a.func) if isinstance(a, ast.Call) else dotted(a)
-        if text.endswith("ForeignKey") and isinstance(a, ast.Call) and a.args:
-            ref = literal(a.args[0])
-            key = "FK"
-        elif text and not typ:
-            typ = text.rsplit(".", 1)[-1]
-    if short.endswith("Field") and short != "Field":
-        typ = typ or short.replace("Field", "")
-        if short == "ForeignKey" or short.startswith("ForeignKey"):
-            key = "FK"
-            ref = literal(call.args[0]) if call.args else None
+    if short in ("ForeignKey", "OneToOneField"):
+        # Django-style relation field: the first argument is the referenced model.
+        key = "FK"
+        ref = literal(call.args[0]) if call.args else None
+        typ = typ or short
+    else:
+        for a in call.args:
+            text = dotted(a.func) if isinstance(a, ast.Call) else dotted(a)
+            if text.endswith("ForeignKey") and isinstance(a, ast.Call) and a.args:
+                ref = literal(a.args[0])
+                key = "FK"
+            elif text and not typ:
+                typ = text.rsplit(".", 1)[-1]
+        if short.endswith("Field") and short != "Field":
+            typ = typ or short.replace("Field", "")
     for k in call.keywords:
         if k.arg == "primary_key" and isinstance(k.value, ast.Constant) and k.value.value:
             key = "PK"

@@ -18,12 +18,15 @@ from ..model.builder import ModelBuilder
 from .cpp_text import line_of, match_brace, strip_comments
 
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]', re.M)
-CLASS_RE = re.compile(r"\b(class|struct)\s+(?:\w+\s+)?(\w+)\s*(?:final\s*)?(?::\s*([^{;]+))?\{")
+# The optional token before the name is an export macro (`class API_EXPORT Foo`), never `final`.
+CLASS_RE = re.compile(
+    r"\b(class|struct)\s+(?:[A-Z_][A-Z0-9_]*\s+)?(\w+)\s*(?:final\s*)?(?::\s*([^{;]+))?\{"
+)
 FUNC_RE = re.compile(
     r"^[ \t]*(?:template\s*<[^>]*>\s*)?(?:[\w:<>,\*&~\s]+?\s+[\*&]*)?((?:\w+::)*~?\w+)\s*\(([^;{}]*)\)\s*(?:const\s*)?(?:noexcept\s*)?(?:override\s*)?(?:->\s*[\w:<>]+\s*)?(?::[^{;]*)?\{",
     re.M,
 )
-CALL_RE = re.compile(r"(?:(\w+)\s*(?:\.|->)\s*)?\b(\w+)\s*\(")
+CALL_RE = re.compile(r"(?:(\w+)\s*(\.|->|::)\s*)?\b(\w+)\s*\(")
 KEYWORDS = {"if", "for", "while", "switch", "return", "catch", "sizeof", "decltype", "static_cast",
             "dynamic_cast", "reinterpret_cast", "const_cast", "defined", "else", "do", "new", "delete"}  # fmt: skip
 
@@ -150,15 +153,27 @@ def analyze_cpp(root: Path, files: list[dict[str, Any]], b: ModelBuilder) -> dic
             if len(targets) == 1:
                 b.edge(nid, targets[0], "inherits", evidence_ids=n["evidence_ids"][:1])
 
-    # Name-based call resolution, only for names defined exactly once.
+    # Name-based call resolution, only for names defined exactly once, and only when the
+    # call shape fits the target: `obj.f()` needs a method, `X::f()` needs class/namespace X
+    # (never std::), and a bare `f()` needs a free function or a method of the caller's class.
     for fid, path, start, end in bodies:
         body = texts[path][start:end]
+        caller_cls = _owner_class(fid)
         for m in CALL_RE.finditer(body):
-            name = m.group(2)
+            qual, sep, name = m.group(1), m.group(2), m.group(3)
             if name in KEYWORDS:
                 continue
             targets = funcs_by_name.get(name, [])
             if len(targets) != 1 or targets[0] == fid:
+                continue
+            target_cls = _owner_class(targets[0])
+            if sep in (".", "->"):
+                if target_cls is None:
+                    continue
+            elif sep == "::":
+                if qual == "std" or (target_cls is not None and target_cls != qual):
+                    continue
+            elif target_cls is not None and target_cls != caller_cls:
                 continue
             ln = line_of(texts[path], start + m.start())
             cev = b.ev(
@@ -173,6 +188,13 @@ def analyze_cpp(root: Path, files: list[dict[str, Any]], b: ModelBuilder) -> dic
             b.edge(fid, targets[0], "calls", evidence_ids=[cev])
 
     return {"system_includes": sorted(system_includes), "files": len(cfiles)}
+
+
+def _owner_class(fid: str) -> str | None:
+    """`fn:path:Ns.Class.method` -> `Class`; free functions -> None."""
+    qual = fid.split(":", 2)[2]
+    parts = qual.split(".")
+    return parts[-2] if len(parts) >= 2 else None
 
 
 def _resolve_include(

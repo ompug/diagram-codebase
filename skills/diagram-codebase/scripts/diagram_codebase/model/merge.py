@@ -41,9 +41,23 @@ class EvidenceChecker:
                 return None
         return self._lines[rel]
 
+    def normalize(self, raw: str) -> str | None:
+        """Repo-relative posix path; strips a leading `./` (not dots of `.github/`)."""
+        raw = raw.strip().replace("\\", "/")
+        if raw.startswith("/"):
+            try:
+                return Path(raw).resolve().relative_to(self.root.resolve()).as_posix()
+            except ValueError:
+                return None
+        while raw.startswith("./"):
+            raw = raw[2:]
+        return raw
+
     def check(self, ev: dict[str, Any]) -> str | None:
         """Return None if acceptable, else a rejection reason."""
-        rel = str(ev.get("file") or "").lstrip("./")
+        rel = self.normalize(str(ev.get("file") or ""))
+        if rel is None:
+            return f"file outside the repository: {ev.get('file')}"
         ev["file"] = rel
         if not rel:
             return "missing file"
@@ -234,6 +248,9 @@ class Merger:
                 self.rejected.append({"where": where, "reason": "missing name"})
                 return
         sub = raw.get("subsystem")
+        if sub is not None and not isinstance(sub, str):
+            self.warnings.append(f"{where}: non-string subsystem ignored")
+            sub = None
         if sub and not sub.startswith("sub:"):
             sub = f"sub:{sub}"
         if existing is not None and raw.get("kind") and raw["kind"] != existing["kind"]:
@@ -261,6 +278,9 @@ class Merger:
         where = f"{src} edge {raw.get('from')} -{kind}-> {raw.get('to')}"
         if kind not in schema.EDGE_KINDS:
             self.rejected.append({"where": where, "reason": f"invalid kind {kind!r}"})
+            return
+        if not all(isinstance(raw.get(k), str) and raw.get(k) for k in ("from", "to")):
+            self.rejected.append({"where": where, "reason": "edge needs string 'from' and 'to'"})
             return
         ev_ids = self._evidence_ids(raw.get("evidence"), where, kind=kind)
         eid = schema.edge_id(kind, raw.get("from", ""), raw.get("to", ""))
@@ -317,6 +337,14 @@ class Merger:
     # ---------------------------------------------------------------- output
     def build(self, extra_meta: dict[str, Any] | None = None) -> dict[str, Any]:
         model = schema.empty_model()
+        # Prune references the model cannot satisfy instead of failing validation.
+        for n in self.b.nodes.values():
+            if n.get("subsystem") and n["subsystem"] not in self.b.subsystems:
+                self.warnings.append(f"node {n['id']}: unknown subsystem {n['subsystem']} removed")
+                n["subsystem"] = None
+            if n.get("parent") and n["parent"] not in self.b.nodes:
+                self.warnings.append(f"node {n['id']}: unknown parent {n['parent']} removed")
+                n["parent"] = None
         # Nodes without subsystem: inherit from parent, else evidence path prefix.
         subs = list(self.b.subsystems.values())
         for n in self.b.nodes.values():

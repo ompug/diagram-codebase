@@ -1,0 +1,168 @@
+{
+  "agent": "algorithms",
+  "area": "point-cloud registration",
+  "subsystems": [
+    {
+      "id": "sub:registration",
+      "name": "Registration core",
+      "description": "Point-cloud preprocessing, features and ICP alignment.",
+      "paths": ["registration"]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "algo:icp",
+      "name": "ICP registration",
+      "kind": "algorithm",
+      "subsystem": "sub:registration",
+      "description": "Point-to-point Iterative Closest Point: nearest-neighbour correspondences, SVD rigid fit, repeat until the RMSE change drops below tol.",
+      "evidence": [
+        {"file": "registration/icp.py", "lines": "32-48", "symbol": "register", "status": "confirmed"}
+      ]
+    },
+    {
+      "id": "fn:registration/icp.py:register",
+      "description": "Entry point of the ICP loop; returns the accumulated 4x4 transform and final RMSE.",
+      "tags": ["hot-path"]
+    },
+    {
+      "id": "data:raw-cloud",
+      "name": "Raw point cloud (N x 3)",
+      "kind": "data_artifact",
+      "subsystem": "sub:registration",
+      "evidence": [
+        {"file": "registration/io.py", "lines": "6-8", "symbol": "load_cloud", "status": "confirmed"}
+      ]
+    },
+    {
+      "id": "data:downsampled-cloud",
+      "name": "Downsampled, filtered cloud",
+      "kind": "data_artifact",
+      "subsystem": "sub:registration",
+      "evidence": [
+        {"file": "run.py", "lines": "13-16", "symbol": "remove_outliers", "status": "confirmed"}
+      ]
+    },
+    {
+      "id": "data:correspondences",
+      "name": "Nearest-neighbour correspondences",
+      "kind": "data_artifact",
+      "subsystem": "sub:registration",
+      "evidence": [
+        {"file": "registration/icp.py", "lines": "39-40", "symbol": "find_correspondences", "status": "confirmed"}
+      ]
+    },
+    {
+      "id": "data:transform",
+      "name": "Rigid transform (4x4)",
+      "kind": "data_artifact",
+      "subsystem": "sub:registration",
+      "evidence": [
+        {"file": "registration/icp.py", "lines": "41-43", "symbol": "estimate_transform", "status": "confirmed"}
+      ]
+    },
+    {
+      "id": "data:result",
+      "name": "Saved transform + RMSE",
+      "kind": "data_artifact",
+      "subsystem": "sub:registration",
+      "evidence": [
+        {"file": "registration/io.py", "lines": "11-12", "symbol": "save_result", "status": "confirmed"}
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": "fn:run.py:main", "to": "fn:registration/icp.py:register", "kind": "calls",
+      "label": "align source to target", "phase": "runtime",
+      "evidence": [{"file": "run.py", "lines": "19", "symbol": "icp.register", "status": "confirmed"}]
+    },
+    {
+      "from": "data:raw-cloud", "to": "data:downsampled-cloud", "kind": "data_flow",
+      "label": "voxel downsample + outlier removal", "phase": "runtime",
+      "evidence": [{"file": "run.py", "lines": "13-16", "symbol": "voxel_downsample", "status": "confirmed"}]
+    },
+    {
+      "from": "data:downsampled-cloud", "to": "data:correspondences", "kind": "data_flow",
+      "label": "nearest neighbour", "phase": "runtime",
+      "evidence": [{"file": "registration/icp.py", "lines": "39", "symbol": "find_correspondences", "status": "confirmed"}]
+    },
+    {
+      "from": "data:correspondences", "to": "data:transform", "kind": "data_flow",
+      "label": "SVD fit", "phase": "runtime",
+      "evidence": [{"file": "registration/icp.py", "lines": "41", "symbol": "estimate_transform", "status": "confirmed"}]
+    },
+    {
+      "from": "data:transform", "to": "data:result", "kind": "data_flow",
+      "label": "save", "phase": "runtime",
+      "evidence": [{"file": "run.py", "lines": "20", "symbol": "save_result", "status": "confirmed"}]
+    }
+  ],
+  "dataflows": [
+    {
+      "id": "df-registration",
+      "name": "Point-cloud registration data flow",
+      "stages": [
+        {"node": "data:raw-cloud", "role": "input", "representation": "ndarray N x 3"},
+        {"node": "data:downsampled-cloud", "role": "transform", "representation": "ndarray M x 3"},
+        {"node": "data:correspondences", "role": "intermediate", "representation": "index array"},
+        {"node": "data:transform", "role": "intermediate", "representation": "4x4 matrix"},
+        {"node": "data:result", "role": "output", "representation": "text file"}
+      ],
+      "links": [
+        {"from": "data:raw-cloud", "to": "data:downsampled-cloud", "label": "voxel + outliers"},
+        {"from": "data:downsampled-cloud", "to": "data:correspondences", "label": "nearest neighbour"},
+        {"from": "data:correspondences", "to": "data:transform", "label": "SVD"},
+        {"from": "data:transform", "to": "data:result", "label": "save_result"}
+      ],
+      "evidence": [
+        {"file": "run.py", "lines": "11-20", "symbol": "register", "status": "confirmed"}
+      ]
+    }
+  ],
+  "algorithms": [
+    {
+      "id": "algo-icp",
+      "name": "ICP",
+      "node": "algo:icp",
+      "purpose": "Estimate the rigid transform aligning the source cloud to the target cloud.",
+      "inputs": ["source cloud", "target cloud", "max_iters", "tol"],
+      "outputs": ["4x4 transform", "rmse"],
+      "stages": [
+        {"id": "init", "name": "Initialise transform", "kind": "step",
+         "evidence": [{"file": "registration/icp.py", "lines": "34-37", "symbol": "prev_error", "status": "confirmed"}]},
+        {"id": "iterate", "name": "Iterate up to max_iters", "kind": "loop",
+         "evidence": [{"file": "registration/icp.py", "lines": "38", "symbol": "max_iters", "status": "confirmed"}]},
+        {"id": "match", "name": "Find correspondences (nearest neighbour)", "kind": "step",
+         "functions": ["fn:registration/icp.py:find_correspondences"],
+         "evidence": [{"file": "registration/icp.py", "lines": "39", "symbol": "find_correspondences", "status": "confirmed"}]},
+        {"id": "fit", "name": "Estimate transform (SVD)", "kind": "step",
+         "functions": ["fn:registration/icp.py:estimate_transform"],
+         "evidence": [{"file": "registration/icp.py", "lines": "41", "symbol": "estimate_transform", "status": "confirmed"}]},
+        {"id": "apply", "name": "Apply transform", "kind": "step",
+         "functions": ["fn:registration/icp.py:apply_transform"],
+         "evidence": [{"file": "registration/icp.py", "lines": "42-43", "symbol": "apply_transform", "status": "confirmed"}]},
+        {"id": "check", "name": "RMSE change < tol?", "kind": "decision",
+         "evidence": [{"file": "registration/icp.py", "lines": "44-45", "symbol": "tol", "status": "confirmed"}]},
+        {"id": "done", "name": "Return transform and RMSE", "kind": "terminal",
+         "evidence": [{"file": "registration/icp.py", "lines": "48", "symbol": "return", "status": "confirmed"}]}
+      ],
+      "transitions": [
+        {"from": "init", "to": "iterate", "label": "start"},
+        {"from": "iterate", "to": "match", "label": "next iteration"},
+        {"from": "match", "to": "fit", "label": "pairs"},
+        {"from": "fit", "to": "apply", "label": "transform"},
+        {"from": "apply", "to": "check", "label": "rmse"},
+        {"from": "check", "to": "done", "label": "converged"},
+        {"from": "check", "to": "iterate", "label": "not converged"},
+        {"from": "iterate", "to": "done", "label": "max_iters reached"}
+      ],
+      "evidence": [
+        {"file": "registration/icp.py", "lines": "32-48", "symbol": "register", "status": "confirmed"}
+      ]
+    }
+  ],
+  "uncertainties": [
+    "Brute-force nearest neighbour is O(N*M); large clouds may need a KD-tree (not present in code)."
+  ]
+}

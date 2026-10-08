@@ -232,7 +232,8 @@ class _IgnoreMatcher:
         return result
 
 
-def _walk_files(root: Path) -> list[str]:
+def _walk_files(root: Path, pruned: Counter | None = None) -> list[str]:
+    """List files under `root`, honoring .gitignore files; `pruned` counts skipped default dirs."""
     matcher = _IgnoreMatcher()
     files: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -243,7 +244,11 @@ def _walk_files(root: Path) -> list[str]:
         keep = []
         for d in sorted(dirnames):
             rel = f"{rel_dir}/{d}" if rel_dir else d
-            if d in DEFAULT_EXCLUDED_DIRS or matcher.ignored(rel, True):
+            if d in DEFAULT_EXCLUDED_DIRS:
+                if pruned is not None:
+                    pruned[d] += 1
+                continue
+            if matcher.ignored(rel, True):
                 continue
             if (Path(dirpath) / d).is_symlink():
                 continue
@@ -271,15 +276,19 @@ def build_inventory(root: Path, config: dict[str, Any]) -> dict[str, Any]:
     max_bytes = int(scan_cfg.get("max_file_bytes", 1_000_000))
     include_tests = bool(scan_cfg.get("include_tests", False))
 
-    listed = _git_files(root)
-    method = "git ls-files"
-    if listed is None:
-        listed = _walk_files(root)
-        method = "filesystem walk with .gitignore subset"
-
     files: list[dict[str, Any]] = []
     skipped: Counter = Counter()
+    # git mode counts excluded *files* per directory name; walk mode never descends into
+    # excluded directories, so it counts the *directories* it pruned.
     excluded_dirs: Counter = Counter()
+    listed = _git_files(root)
+    method = "git ls-files"
+    excluded_unit = "files"
+    if listed is None:
+        listed = _walk_files(root, excluded_dirs)
+        method = "filesystem walk with .gitignore subset"
+        excluded_unit = "directories"
+
     for rel in listed:
         parts = rel.split("/")
         hit_dir = next((p for p in parts[:-1] if p in DEFAULT_EXCLUDED_DIRS), None)
@@ -342,6 +351,7 @@ def build_inventory(root: Path, config: dict[str, Any]) -> dict[str, Any]:
         "unsupported_languages": dict(unsupported),
         "skipped": dict(skipped),
         "excluded_dirs": dict(excluded_dirs),
+        "excluded_dirs_unit": excluded_unit,
         "extra_excludes": list(extra_excludes),
         "top_level_dirs": sorted({f["path"].split("/")[0] for f in files if "/" in f["path"]}),
     }

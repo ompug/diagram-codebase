@@ -62,10 +62,17 @@ class Ros2Extractor:
         self.found = True
         return nid
 
-    def owner(self, file: str, line: int) -> str | None:
+    def owner(self, file: str, line: int, class_id: str | None = None) -> str | None:
+        """ROS node that owns a declaration: by enclosing Node class, else by position."""
         nodes = sorted(self.node_by_file.get(file, []), key=lambda n: n["line"])
         if not nodes:
             return None
+        if class_id is not None:
+            hit = next((n for n in nodes if n["class"] == class_id), None)
+            if hit is not None:
+                return hit["id"]
+            if len(nodes) > 1:
+                return None  # a non-node class in a multi-node file: ambiguous
         best = nodes[0]
         for n in nodes:
             if n["line"] <= line:
@@ -97,12 +104,13 @@ class Ros2Extractor:
             self._py_nodes(pf)
             pub_attrs: dict[str, str] = {}
             for rec in pf.calls:
-                owner = self.owner(pf.path, rec.line)
+                cls_scope = rec.__dict__.get("_class_scope")
+                cls_id = pf.classes[cls_scope]["id"] if cls_scope else None
+                owner = self.owner(pf.path, rec.line, cls_id)
                 if owner is None:
                     continue
-                cls_scope = rec.__dict__.get("_class_scope")
                 a, kw = rec.args, rec.kwargs
-                msg = _type_name(a[0]) if a else None
+                msg = _type_name(a[0], pf) if a else None
                 if rec.attr == "create_publisher" and len(a) >= 2 and isinstance(a[1], str):
                     tid, ev = self._iface("topic", a[1], pf.path, rec.line, msg, "ast")
                     self.b.edge(
@@ -177,7 +185,7 @@ class Ros2Extractor:
                     and len(a) >= 3
                     and isinstance(a[2], str)
                 ):
-                    msg = _type_name(a[1])
+                    msg = _type_name(a[1], pf)
                     aid, ev = self._iface("action", a[2], pf.path, rec.line, msg, "ast")
                     if rec.attr == "ActionServer":
                         self.b.edge(
@@ -245,7 +253,7 @@ class Ros2Extractor:
                         phase="runtime",
                     )
                 elif (
-                    rec.attr == "lookup_transform"
+                    rec.attr in ("lookup_transform", "lookupTransform")
                     and len(a) >= 2
                     and isinstance(a[0], str)
                     and isinstance(a[1], str)
@@ -306,33 +314,37 @@ class Ros2Extractor:
                 self.ros_node(rec.args[0], pf.path, rec.line, None, "python")
 
     def _py_tf_assignments(self, pf: PyFile) -> None:
-        frames: list[tuple[str, str, int]] = []
+        frames: list[tuple[str, str, int, str]] = []
         for target, value, line, _caller in pf.str_assigns:
-            if target.endswith("header.frame_id"):
-                frames.append(("parent", value, line))
-            elif target.endswith("child_frame_id"):
-                frames.append(("child", value, line))
+            if target.endswith(".header.frame_id"):
+                frames.append(("parent", value, line, target[: -len(".header.frame_id")]))
+            elif target.endswith(".child_frame_id"):
+                frames.append(("child", value, line, target[: -len(".child_frame_id")]))
         self._pair_frames(frames, pf.path, "ast")
 
-    def _pair_frames(self, frames: list[tuple[str, str, int]], file: str, src: str) -> None:
-        pending_parent: tuple[str, int] | None = None
-        pending_child: tuple[str, int] | None = None
-        for role, value, line in frames:
-            if role == "parent":
-                pending_parent = (value, line)
-            else:
-                pending_child = (value, line)
-            if pending_parent and pending_child and abs(pending_parent[1] - pending_child[1]) <= 15:
+    def _pair_frames(self, frames: list[tuple[str, str, int, str]], file: str, src: str) -> None:
+        """Pair `x.header.frame_id = P` with `x.child_frame_id = C` on the same variable.
+
+        Only a message that has both fields (a TransformStamped) describes a TF
+        edge; a PoseStamped header alone never does.
+        """
+        pending_parent: dict[str, tuple[str, int]] = {}
+        pending_child: dict[str, tuple[str, int]] = {}
+        for role, value, line, var in sorted(frames, key=lambda f: f[2]):
+            (pending_parent if role == "parent" else pending_child)[var] = (value, line)
+            parent, child = pending_parent.get(var), pending_child.get(var)
+            if parent and child and abs(parent[1] - child[1]) <= 15:
+                pending_parent.pop(var)
+                pending_child.pop(var)
                 self._tf(
-                    pending_parent[0],
-                    pending_child[0],
+                    parent[0],
+                    child[0],
                     file,
-                    min(pending_parent[1], pending_child[1]),
+                    min(parent[1], child[1]),
                     "broadcast",
                     src,
                     self.owner(file, line),
                 )
-                pending_parent = pending_child = None
 
     def _tf(
         self, parent: str, child: str, file: str, line: int, how: str, src: str, owner: str | None
@@ -515,7 +527,9 @@ class Ros2Extractor:
             for m in re.finditer(r"declare_parameter\s*(?:<[^>]+>)?\s*\(\s*\"([\w.]+)\"", code):
                 ln = line_of(code, m.start())
                 self._param(self.owner(path, ln), m.group(1), path, ln, None, "regex")
-            for m in re.finditer(r"lookup_transform\s*\(\s*\"([^\"]+)\"\s*,\s*\"([^\"]+)\"", code):
+            for m in re.finditer(
+                r"lookup_?[tT]ransform\s*\(\s*\"([^\"]+)\"\s*,\s*\"([^\"]+)\"", code
+            ):
                 ln = line_of(code, m.start())
                 self._tf(m.group(2), m.group(1), path, ln, "lookup", "regex", self.owner(path, ln))
             for m in re.finditer(r"(Static)?TransformBroadcaster", code):
@@ -538,14 +552,16 @@ class Ros2Extractor:
                 )
                 break
             frames = [
-                ("parent", m.group(1), line_of(code, m.start()))
-                for m in re.finditer(r"header\.frame_id\s*=\s*\"([^\"]+)\"", code)
+                ("parent", m.group(2), line_of(code, m.start()), m.group(1))
+                for m in re.finditer(
+                    r"(\w+)\s*(?:\.|->)\s*header\.frame_id\s*=\s*\"([^\"]+)\"", code
+                )
             ]
             frames += [
-                ("child", m.group(1), line_of(code, m.start()))
-                for m in re.finditer(r"child_frame_id\s*=\s*\"([^\"]+)\"", code)
+                ("child", m.group(2), line_of(code, m.start()), m.group(1))
+                for m in re.finditer(r"(\w+)\s*(?:\.|->)\s*child_frame_id\s*=\s*\"([^\"]+)\"", code)
             ]
-            self._pair_frames(sorted(frames, key=lambda x: x[2]), path, "regex")
+            self._pair_frames(frames, path, "regex")
 
     def _cpp_method(self, path: str, method: str) -> str | None:
         stem = path.rsplit(".", 1)[0]
@@ -683,20 +699,21 @@ class Ros2Extractor:
             dst = new_id if e["to"] == old_id else e["to"]
             self.b.edge(src, dst, e["kind"], label=e["label"], payload=e["payload"], phase=e["phase"],
                         evidence_ids=[*e["evidence_ids"], ev], remapped_from=old_id)  # fmt: skip
-        # Callback edges hang off the topic; move those whose callback belongs to this node.
+        # Callback (triggers) and per-method publish edges connect the topic to this node's
+        # implementation methods rather than the node itself; move those too.
         impl = self.b.nodes[nid]["metadata"].get("implementation") or ""
-        cls_prefix = impl.replace("cls:", "fn:", 1) + "."
+        cls_prefix = impl.replace("cls:", "fn:", 1) + "." if impl else None
         for e in list(self.b.edges.values()):
-            if e["from"] == old_id and e["kind"] == "triggers" and e["to"].startswith(cls_prefix):
-                del self.b.edges[e["id"]]
-                self.b.edge(
-                    new_id,
-                    e["to"],
-                    "triggers",
-                    label=e["label"],
-                    evidence_ids=[*e["evidence_ids"], ev],
-                    phase=e["phase"],
-                )
+            if cls_prefix is None or old_id not in (e["from"], e["to"]):
+                continue
+            other = e["to"] if e["from"] == old_id else e["from"]
+            if not other.startswith(cls_prefix):
+                continue
+            del self.b.edges[e["id"]]
+            src = new_id if e["from"] == old_id else e["from"]
+            dst = new_id if e["to"] == old_id else e["to"]
+            self.b.edge(src, dst, e["kind"], label=e["label"], payload=e["payload"], phase=e["phase"],
+                        evidence_ids=[*e["evidence_ids"], ev], remapped_from=old_id)  # fmt: skip
         still_used = any(old_id in (e["from"], e["to"]) for e in self.b.edges.values())
         if not still_used:
             self.b.nodes.pop(old_id, None)
@@ -749,10 +766,19 @@ class Ros2Extractor:
             self._apply_launch(path, line, exe, name, ns, remaps, exe_to_nodes, "regex")
 
 
-def _type_name(v: Any) -> str | None:
-    if isinstance(v, dict) and "name" in v:
-        return v["name"].split(".")[-1]
-    return None
+def _type_name(v: Any, pf: PyFile | None = None) -> str | None:
+    """Interface type as `pkg/Name` when the import shows the package, else `Name`."""
+    if not (isinstance(v, dict) and isinstance(v.get("name"), str)):
+        return None
+    text = v["name"]
+    head, _, rest = text.partition(".")
+    full = pf.imports.get(head) if pf is not None else None
+    if full:
+        full = f"{full}.{rest}" if rest else full
+        parts = full.split(".")
+        if len(parts) >= 3 and parts[-2] in ("msg", "srv", "action"):
+            return f"{parts[0]}/{parts[-1]}"
+    return text.split(".")[-1]
 
 
 def _cpp_type(t: str) -> str:

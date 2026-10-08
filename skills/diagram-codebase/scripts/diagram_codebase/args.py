@@ -130,7 +130,7 @@ def parse_args(raw: str | None) -> dict[str, Any]:
         elif flag in _VALUE_FLAGS:
             if eq:
                 value = inline
-            elif i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+            elif i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
                 i += 1
                 value = tokens[i]
             else:

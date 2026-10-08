@@ -78,6 +78,12 @@ def _read(path: Path) -> str:
         return ""
 
 
+def _line_of_key(text: str, key: str) -> int:
+    """Line of a TOML-style `key = ...` declaration (falls back to the first mention)."""
+    m = re.search(r"^\s*[\"']?" + re.escape(key) + r"[\"']?\s*=", text, re.M)
+    return text.count("\n", 0, m.start()) + 1 if m else _line_of(text, key)
+
+
 def _line_of(text: str, needle: str) -> int:
     idx = text.find(needle)
     return text.count("\n", 0, idx) + 1 if idx >= 0 else 1
@@ -126,7 +132,7 @@ def parse_manifests(root: Path, files: list[dict[str, Any]]) -> dict[str, Any]:
                         "name": script,
                         "target": str(target),
                         "file": rel,
-                        "line": _line_of(text, script),
+                        "line": _line_of_key(text, script),
                         "kind": "console_script",
                     }
                 )
@@ -276,7 +282,7 @@ def parse_manifests(root: Path, files: list[dict[str, Any]]) -> dict[str, Any]:
             out["manifest_files"].append(rel)
             text = _read(path)
             base_image = re.search(r"^\s*FROM\s+(\S+)", text, re.M | re.I)
-            ports = re.findall(r"^\s*EXPOSE\s+([\d\s/a-z]+)", text, re.M | re.I)
+            ports = re.findall(r"^[ \t]*EXPOSE[ \t]+([\d \t/a-z]+)", text, re.M | re.I)
             cmd = re.search(r"^\s*(?:CMD|ENTRYPOINT)\s+(.+)$", text, re.M | re.I)
             out["deployments"].append(
                 {"name": rel.rsplit("/", 2)[-2] if "/" in rel else "app", "kind": "dockerfile", "file": rel, "line": 1,
@@ -350,6 +356,8 @@ def _parse_compose(text: str, rel: str) -> list[dict[str, Any]]:
     svc_indent = None
     current: dict[str, Any] | None = None
     key_ctx = None
+    key_indent = 0  # indentation of the `ports:` / `depends_on:` key being collected
+    depends_indent: int | None = None
     for i, raw in enumerate(lines, 1):
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
@@ -371,12 +379,16 @@ def _parse_compose(text: str, rel: str) -> list[dict[str, Any]]:
             continue
         if current is None:
             continue
+        if key_ctx and indent <= key_indent:
+            key_ctx = None  # a sibling key ends the list/mapping being collected
         if stripped.startswith("image:"):
             current["image"] = stripped.split(":", 1)[1].strip().strip("'\"")
         elif stripped.startswith("build:"):
             current["build"] = stripped.split(":", 1)[1].strip().strip("'\"") or "."
         elif stripped.startswith(("ports:", "depends_on:")):
             key_ctx = stripped[:-1] if stripped.endswith(":") else None
+            key_indent = indent
+            depends_indent = None
             inline = stripped.split(":", 1)[1].strip()
             if inline.startswith("["):
                 vals = [v.strip().strip("'\"") for v in inline.strip("[]").split(",") if v.strip()]
@@ -385,7 +397,10 @@ def _parse_compose(text: str, rel: str) -> list[dict[str, Any]]:
         elif stripped.startswith("- ") and key_ctx in ("ports", "depends_on"):
             current[key_ctx].append(stripped[2:].strip().strip("'\""))
         elif key_ctx == "depends_on" and stripped.endswith(":"):
-            current["depends_on"].append(stripped[:-1].strip())
+            # Long form: `db:` then `condition: ...` nested deeper; only the first level names services.
+            if depends_indent is None or indent == depends_indent:
+                depends_indent = indent
+                current["depends_on"].append(stripped[:-1].strip().strip("'\""))
         elif stripped.endswith(":") and not stripped.startswith("-"):
             key_ctx = None
     return services

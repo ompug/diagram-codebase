@@ -1,0 +1,7 @@
+[project]
+name = "shop-events"
+version = "0.1.0"
+dependencies = ["celery>=5"]
+
+[project.scripts]
+shop = "shop.app:main"

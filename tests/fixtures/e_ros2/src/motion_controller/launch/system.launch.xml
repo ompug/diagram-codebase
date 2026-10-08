@@ -1,0 +1,7 @@
+<launch>
+  <include file="$(find-pkg-share lidar_localization)/launch/localization.launch.py"/>
+  <node pkg="motion_controller" exec="controller" name="controller">
+    <remap from="cmd_vel" to="/base/cmd_vel"/>
+    <param name="max_speed" value="0.4"/>
+  </node>
+</launch>

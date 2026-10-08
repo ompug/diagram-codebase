@@ -176,6 +176,15 @@ DiagramSpec (renderer-independent; `mermaid/build.py` turns it into text):
 }
 ```
 
+Planner additions (see `docs/PLANNER.md` for heuristics): each spec also has `level`
+(`subsystem|module|symbol`); `skipped[]` entries are `{type, id?, reason}` (focus misses use
+`type: "focus"`); `coverage` = `{definition, model_nodes, master, detail, any_diagram,
+drawn_individually: {count, of}, only_in_model: {count, of, by_kind, ids}}`. Split ids use
+`-part-N`; a derived data-flow diagram is `dataflow-derived`; deep mode adds
+`dependency-<subsystem>`; algorithm stage nodes are `stage:<algo id>:<stage id>`. The
+planner never reads the clock: `dc.py plan` passes `options.generated_at` and fills
+`content_hash`.
+
 Shapes: `rect rounded stadium circle diamond hexagon subroutine cylinder lean_r lean_l odd`.
 Categories (legend colors): `app` blue, `data` green, `processing` purple,
 `external` orange, `infra` gray, `error` red, `messaging` teal, `context` light gray.
@@ -220,6 +229,46 @@ Diagram status: `pending → generated → placed → verified`, or `failed` aft
 Every section the skill creates carries shared plugin data in namespace
 `diagramcodebase` (`diagram_id`, `run_id`, `content_hash`, `row`) so state can be
 reconciled from the canvas.
+
+## CLI (`python3 ${CLAUDE_SKILL_DIR}/scripts/dc.py <command>`)
+
+All commands accept `--repo <path>` (default: git toplevel of cwd) and `--out <dir>`
+(default `<repo>/.diagram-codebase`), print JSON (or Markdown where noted) to stdout,
+and exit non-zero with a one-line message on `DCError`.
+
+| Command | Purpose |
+|---|---|
+| `args "<raw $ARGUMENTS>"` | parse options → JSON (`help: true` → print usage) |
+| `init --args-json '<json>'` | create/resume run: out dir, `.gitignore`, config, manifest; reports mode fresh/resume/update and next step |
+| `scan` | inventory + deterministic findings; prints the analysis brief |
+| `findings-template` | prints the findings JSON template + id conventions for analysis agents |
+| `check-findings <file>` | validate one findings file (evidence check) without merging |
+| `merge` | merge all findings → model.json + validation.json; prints summary |
+| `plan` | plan.json + mermaid/*.mmd + lint + sanitize + optional parser check + publish/review.md |
+| `review` | Markdown summary of what will be published and estimated Figma calls |
+| `confirm` | record user approval to publish |
+| `next` / `record --action <id> [--result-file f] [--error text]` | driver loop |
+| `status` | manifest summary (phases, diagrams, pending action) |
+| `budget` | local ledger estimates (never Figma's quota) |
+| `update-diff` | `--update`: affected files/nodes/diagrams + recommendation |
+| `summary` | write and print REPORT.md |
+| `run --dry-run` | init + scan + merge + plan without Claude findings (CI/examples) |
+
+CLI behavior details (consumed by SKILL.md):
+- `args` also reads the raw string from stdin when no positional is given, so SKILL.md
+  can pass `$ARGUMENTS` through a quoted heredoc (safe for any quotes in user input).
+- `init` prints `{out_dir, mode: fresh|resume|update, resume_from_phase, next_step}`,
+  writes the resolved out dir into the manifest, and copies `hooks/figma_gate.py`
+  into the cache dir. Later commands find the out dir via `--out`, else
+  `<repo>/.diagram-codebase`.
+- Raw Figma tool results are saved by Claude to `<out>/publish/results/<action_id>.txt`;
+  `record --result-file -` reads stdin. `ask_user` answers are recorded as `{"answer": "..."}`.
+- `next` emits `confirm` until `confirm` ran (or `--yes`); `use_figma` params already
+  include `skillNames`; `tool` is the bare tool name (call it on whichever Figma
+  server prefix is connected); `stop` actions carry the reason in `explain`.
+- `record` prints the FigJam file URL as soon as it is known.
+- `update-diff` names affected findings areas by slug (`execution`, `dataflow`,
+  `algorithms`, `infrastructure`, `sub-<slug>`) and recommends `partial|full|none`.
 
 ## Rate limiting
 

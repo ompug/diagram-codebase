@@ -106,3 +106,54 @@ def label_propagation(
                 continue
         merged.append(g)
     return merged
+
+
+def connected_components(nodes: Iterable[str], edges: Iterable[tuple[str, str]]) -> list[list[str]]:
+    """Weakly connected components, largest first, each sorted (deterministic)."""
+    nodes = sorted(set(nodes))
+    nbrs: dict[str, set[str]] = defaultdict(set)
+    for a, b in edges:
+        nbrs[a].add(b)
+        nbrs[b].add(a)
+    seen: set[str] = set()
+    out: list[list[str]] = []
+    for root in nodes:
+        if root in seen:
+            continue
+        comp, todo = [], [root]
+        seen.add(root)
+        while todo:
+            cur = todo.pop()
+            comp.append(cur)
+            for m in sorted(nbrs[cur]):
+                if m not in seen:
+                    seen.add(m)
+                    todo.append(m)
+        out.append(sorted(comp))
+    return sorted(out, key=lambda c: (-len(c), c[0]))
+
+
+def pack(groups: list[list[str]], max_size: int) -> list[list[str]]:
+    """Greedy first-fit packing of groups into bins of at most `max_size` items.
+
+    Groups larger than `max_size` are cut into consecutive chunks first."""
+    pieces: list[list[str]] = []
+    for g in groups:
+        for i in range(0, len(g), max_size):
+            pieces.append(list(g[i : i + max_size]))
+    bins: list[list[str]] = []
+    for piece in sorted(pieces, key=lambda p: (-len(p), p[0] if p else "")):
+        for b in bins:
+            if len(b) + len(piece) <= max_size:
+                b.extend(piece)
+                break
+        else:
+            bins.append(piece)
+    return bins
+
+
+def jaccard(a: Iterable[str], b: Iterable[str]) -> float:
+    sa, sb = set(a), set(b)
+    if not sa and not sb:
+        return 1.0
+    return len(sa & sb) / len(sa | sb)

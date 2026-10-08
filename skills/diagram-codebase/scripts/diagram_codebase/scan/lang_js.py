@@ -37,10 +37,14 @@ CLASS_RE = re.compile(
     r"""^(export\s+)?(?:default\s+)?class\s+([\w$]+)(?:\s+extends\s+([\w$.]+))?""", re.M
 )
 ROUTE_RE = re.compile(
-    r"""\b([\w$]+)\.(get|post|put|delete|patch|all)\(\s*['"`](/[^'"`]*)['"`]\s*,([^;]*?)\)\s*;?\s*$""",
-    re.M,
+    r"""\b([\w$]+)\.(get|post|put|delete|patch|all)\(\s*['"`](/[^'"`]*)['"`]\s*,"""
 )
-FETCH_RE = re.compile(r"""\bfetch\(\s*(['"`])([^'"`]+)\1([^)]*)""")
+# Receivers created by a server/router constructor: `const app = express()`, `express.Router()`.
+ROUTER_CTOR_RE = re.compile(
+    r"""(?:const|let|var)\s+([\w$]+)\s*=\s*(?:new\s+)?(?:express|Router|express\.Router|fastify|Fastify|Koa|KoaRouter|Hono)\s*\("""
+)
+SERVER_PACKAGES = ("express", "fastify", "koa", "@koa/router", "koa-router", "hono", "restify")
+FETCH_RE = re.compile(r"""\bfetch\(\s*(['"`])([^'"`]+)\1""")
 AXIOS_RE = re.compile(
     r"""\b(?:axios|api|client|http)\.(get|post|put|delete|patch)\(\s*(['"`])([^'"`]+)\2"""
 )
@@ -52,7 +56,11 @@ KAFKA_SEND_RE = re.compile(
     r"""\.(send|subscribe)\(\s*\{\s*topics?\s*:\s*\[?\s*['"`]([\w:./-]+)['"`]"""
 )
 BUILTIN_EVENTS = {"data", "end", "error", "close", "finish", "connect", "connection", "open", "drain", "readable",
-                  "exit", "listening", "request", "upgrade", "uncaughtException", "unhandledRejection", "SIGINT", "SIGTERM"}  # fmt: skip
+                  "exit", "listening", "request", "upgrade", "uncaughtException", "unhandledRejection", "SIGINT", "SIGTERM",
+                  # DOM / UI events are not messaging channels
+                  "click", "dblclick", "submit", "change", "input", "keydown", "keyup", "keypress", "mousedown",
+                  "mouseup", "mousemove", "mouseenter", "mouseleave", "focus", "blur", "load", "unload", "resize",
+                  "scroll", "ready", "touchstart", "touchend", "beforeunload", "hashchange", "popstate"}  # fmt: skip
 MONGOOSE_RE = re.compile(r"""mongoose\.model\(\s*['"`](\w+)['"`]""")
 PRISMA_RE = re.compile(
     r"""\bprisma\.(\w+)\.(findMany|findUnique|findFirst|create|update|delete|upsert|count|aggregate|createMany|updateMany|deleteMany)\b"""
@@ -98,6 +106,7 @@ def analyze_js(root: Path, files: list[dict[str, Any]], b: ModelBuilder) -> dict
     paths = {f["path"] for f in jsfiles}
     exports: dict[str, dict[str, str]] = {}  # path -> {name: node id}
     texts: dict[str, str] = {}
+    blanks: dict[str, str] = {}
     external: set[str] = set()
     requests: list[tuple[str, str, str, int, str]] = []  # (mod, method, path, line, file)
 
@@ -108,7 +117,9 @@ def analyze_js(root: Path, files: list[dict[str, Any]], b: ModelBuilder) -> dict
         except OSError:
             continue
         code = strip_comments(raw, keep_strings=True, js=True)
+        blank = strip_comments(raw, keep_strings=False, js=True)  # same offsets, strings blanked
         texts[path] = code
+        blanks[path] = blank
         mid = f"mod:{path}"
         is_ui = path.endswith((".jsx", ".tsx")) or bool(re.search(r"return\s*\(\s*<[A-Za-z]", code))
         ev = b.ev(
@@ -130,9 +141,9 @@ def analyze_js(root: Path, files: list[dict[str, Any]], b: ModelBuilder) -> dict
         )
         exports[path] = {}
         for m in FUNC_RE.finditer(code):
-            _def(b, path, code, m, exports, is_ui)
+            _def(b, path, code, blank, m, exports, is_ui)
         for m in ARROW_RE.finditer(code):
-            _def(b, path, code, m, exports, is_ui)
+            _def(b, path, code, blank, m, exports, is_ui)
         for m in CLASS_RE.finditer(code):
             ln = line_of(code, m.start())
             cid = f"cls:{path}:{m.group(2)}"
@@ -156,6 +167,8 @@ def analyze_js(root: Path, files: list[dict[str, Any]], b: ModelBuilder) -> dict
             names: dict[str, str] = {}
             if m.group(1):
                 names[m.group(1)] = "default"
+            if m.group(3):
+                names[m.group(3)] = "*"
             for part in (m.group(2) or "").split(","):
                 part = part.strip()
                 if not part:
@@ -190,41 +203,50 @@ def analyze_js(root: Path, files: list[dict[str, Any]], b: ModelBuilder) -> dict
             for local, orig in names.items():
                 bindings[local] = (target, orig)
 
-        # Calls to imported bindings (static_inferred; enclosing function unknown -> module).
+        # Calls to imported bindings (static_inferred: name-based). Every call site counts,
+        # attributed to the enclosing top-level function (or the module).
+        blank = blanks[path]
         for local, (target, orig) in bindings.items():
-            tid = exports.get(target, {}).get(orig) or (
-                exports.get(target, {}).get("default") if orig == "default" else None
-            )
-            if not tid or not tid.startswith("fn:"):
-                continue
-            m = re.search(
-                r"(?<![\w$.])" + re.escape(local) + r"\s*\(|<" + re.escape(local) + r"[\s/>]", code
-            )
-            if m:
-                ln = line_of(code, m.start())
-                caller = _enclosing(b, path, ln) or mid
-                kind = "calls"
-                detail = "renders" if code[m.start()] == "<" else "call"
-                cev = b.ev(
-                    path,
-                    ln,
-                    ln,
-                    symbol=local,
-                    detail=f"{detail} {local}",
-                    source="regex",
-                    status="static_inferred",
-                )
-                b.edge(
-                    caller,
-                    tid,
-                    kind,
-                    evidence_ids=[cev],
-                    label="renders" if detail == "renders" else "",
-                )
+            texports = exports.get(target, {})
+            sites: list[tuple[str, str]] = []  # (regex, target id)
+            tid = texports.get(orig) if orig not in ("*",) else None
+            if tid and tid.startswith("fn:"):
+                sites.append((r"(?<![\w$.])" + re.escape(local) + r"\s*\(", tid))
+                sites.append((r"<" + re.escape(local) + r"[\s/>]", tid))
+            if orig in ("*", "default") and not tid:
+                for name, fid in texports.items():
+                    if name != "default" and fid.startswith("fn:"):
+                        pat = r"(?<![\w$.])" + re.escape(local) + r"\." + re.escape(name) + r"\s*\("
+                        sites.append((pat, fid))
+            for pat, fid in sites:
+                for m in re.finditer(pat, blank):
+                    ln = line_of(code, m.start())
+                    caller = _enclosing(b, path, ln) or mid
+                    if caller == fid:
+                        continue
+                    renders = blank[m.start()] == "<"
+                    cev = b.ev(
+                        path,
+                        ln,
+                        ln,
+                        symbol=local,
+                        detail=f"{'renders' if renders else 'call'} {local}",
+                        source="regex",
+                        status="static_inferred",
+                    )
+                    b.edge(
+                        caller,
+                        fid,
+                        "calls",
+                        evidence_ids=[cev],
+                        label="renders" if renders else "",
+                    )
 
-        _routes(b, path, code, exports, bindings)
+        _routes(b, path, code, blanks[path], exports, bindings, specs)
         for m in FETCH_RE.finditer(code):
-            method = re.search(r"method\s*:\s*['\"`](\w+)", m.group(3))
+            open_idx = code.index("(", m.start())
+            args = code[open_idx : _match(blanks[path], open_idx, "(", ")") + 1]
+            method = re.search(r"method\s*:\s*['\"`](\w+)", args)
             requests.append(
                 (
                     path,
@@ -267,9 +289,40 @@ def analyze_js(root: Path, files: list[dict[str, Any]], b: ModelBuilder) -> dict
     return {"files": len(jsfiles), "external_packages": sorted(external)}
 
 
-def _def(b: ModelBuilder, path: str, code: str, m: re.Match, exports: dict, is_ui: bool) -> None:
+def _match(text: str, open_idx: int, opener: str, closer: str) -> int:
+    """Index of the bracket closing `text[open_idx]` (text must have strings/comments blanked)."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == opener:
+            depth += 1
+        elif text[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    return len(text) - 1
+
+
+def _body_end(blank: str, m: re.Match) -> int:
+    """Offset where a matched function/arrow definition's body ends."""
+    i = m.end()
+    if m.re is FUNC_RE:
+        i = _match(blank, m.end() - 1, "(", ")") + 1
+        brace = blank.find("{", i)
+        return _match(blank, brace, "{", "}") if brace >= 0 else len(blank) - 1
+    while i < len(blank) and blank[i] in " \t\r\n":
+        i += 1
+    if i < len(blank) and blank[i] in "{(":
+        return _match(blank, i, blank[i], "}" if blank[i] == "{" else ")")
+    nl = blank.find("\n", i)
+    return nl if nl >= 0 else len(blank) - 1
+
+
+def _def(
+    b: ModelBuilder, path: str, code: str, blank: str, m: re.Match, exports: dict, is_ui: bool
+) -> None:
     name = m.group(2)
     ln = line_of(code, m.start())
+    end_ln = line_of(code, _body_end(blank, m))
     fid = f"fn:{path}:{name}"
     exported = (
         bool(m.group(1))
@@ -279,7 +332,7 @@ def _def(b: ModelBuilder, path: str, code: str, m: re.Match, exports: dict, is_u
     ev = b.ev(path, ln, ln, symbol=name, detail="function definition", source="regex")
     tags = (["exported"] if exported else []) + (["ui-component"] if component else [])
     b.node(fid, f"{name}()" if not component else name, "ui_component" if component else "function",
-           parent=f"mod:{path}", evidence_ids=[ev], tags=tags, file=path, line=ln)  # fmt: skip
+           parent=f"mod:{path}", evidence_ids=[ev], tags=tags, file=path, line=ln, end_line=end_ln)  # fmt: skip
     exports[path][name] = fid
     if re.search(
         r"export\s+default\s+(?:async\s+)?(?:function\s+)?" + re.escape(name) + r"\b", code
@@ -292,26 +345,32 @@ def _enclosing(b: ModelBuilder, path: str, line: int) -> str | None:
     for nid, n in b.nodes.items():
         if n["kind"] in ("function", "ui_component") and n["metadata"].get("file") == path:
             ln = n["metadata"].get("line", 0)
-            if best_line < ln <= line:
+            end = n["metadata"].get("end_line", ln)
+            if best_line < ln <= line <= end:
                 best, best_line = nid, ln
     return best
 
 
-def _routes(b: ModelBuilder, path: str, code: str, exports: dict, bindings: dict) -> None:
+def _routes(
+    b: ModelBuilder,
+    path: str,
+    code: str,
+    blank: str,
+    exports: dict,
+    bindings: dict,
+    specs: list[tuple[str, int, dict[str, str]]],
+) -> None:
+    # Only receivers that are demonstrably servers/routers declare routes; an HTTP client
+    # call such as `instance.post("/api/x", body)` has the same shape and must not match.
+    receivers = {"router"} | set(ROUTER_CTOR_RE.findall(code))
+    if any(spec in SERVER_PACKAGES for spec, _, _ in specs):
+        receivers |= {"app", "server", "api"}
     for m in ROUTE_RE.finditer(code):
-        method, route, rest = m.group(2).upper(), m.group(3), m.group(4)
-        if m.group(1) in (
-            "axios",
-            "api",
-            "client",
-            "http",
-            "fetch",
-            "map",
-            "headers",
-            "params",
-            "searchParams",
-        ):
+        if m.group(1) not in receivers:
             continue
+        method, route = m.group(2).upper(), m.group(3)
+        open_idx = code.index("(", m.start(2))
+        args = code[m.end() : _match(blank, open_idx, "(", ")")]
         ln = line_of(code, m.start())
         norm = normalize_route(route)
         nid = f"api:{method} {norm}"
@@ -327,11 +386,18 @@ def _routes(b: ModelBuilder, path: str, code: str, exports: dict, bindings: dict
             path=norm,
             framework="express",
         )
-        handler_name = rest.strip().split(",")[-1].strip().split(".")[-1]
-        handler = exports.get(path, {}).get(handler_name)
-        if handler is None and handler_name in bindings:
-            tgt, orig = bindings[handler_name]
-            handler = exports.get(tgt, {}).get(orig)
+        # Last argument names the handler when it is a plain (possibly dotted) identifier.
+        last = args.strip().rstrip(",").split(",")[-1].strip()
+        handler = None
+        if re.fullmatch(r"[\w$]+(?:\.[\w$]+)?", last):
+            head, _, attr = last.rpartition(".")
+            if not head:
+                handler = exports.get(path, {}).get(attr)
+                if handler is None and attr in bindings:
+                    tgt, orig = bindings[attr]
+                    handler = exports.get(tgt, {}).get(orig)
+            elif head in bindings:  # `ctrl.list` where ctrl is an imported module
+                handler = exports.get(bindings[head][0], {}).get(attr)
         if handler:
             b.edge(nid, handler, "handles", evidence_ids=[ev], label="handled by", phase="runtime")
         else:

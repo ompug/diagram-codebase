@@ -1,0 +1,9 @@
+source: data/source.xyz
+target: data/target.xyz
+voxel_size: 0.05
+outlier_k: 8
+outlier_std: 2.0
+icp:
+  max_iters: 50
+  tol: 1.0e-6
+output: out/transform.txt
