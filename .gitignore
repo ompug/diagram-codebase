@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+node_modules/
+.coverage
+htmlcov/
+# Output of running the skill against any repository (including this one)
+.diagram-codebase/

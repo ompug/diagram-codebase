@@ -1,0 +1,8 @@
+{
+  "name": "diagram-codebase",
+  "version": "0.1.0",
+  "description": "Analyze a repository into an evidence-backed architecture model and publish editable FigJam diagrams through the official Figma MCP server.",
+  "author": { "name": "diagram-codebase contributors" },
+  "license": "MIT",
+  "keywords": ["architecture", "diagrams", "figma", "figjam", "mermaid", "static-analysis"]
+}
