@@ -73,6 +73,14 @@ class ModelView:
         for e in sorted(self.edges, key=lambda e: e["id"]):
             if e["kind"] == "handles":
                 self._handler_of.setdefault(e["from"], e["to"])
+        # A module that implements exactly one ROS node folds into that node at module
+        # level, so the node and its own source file are not drawn as two boxes.
+        ros_files: dict[str, list[str]] = defaultdict(list)
+        for n in model["nodes"]:
+            f = (n.get("metadata") or {}).get("file")
+            if n["kind"] == "ros_node" and f and f"mod:{f}" in self.nodes:
+                ros_files[f"mod:{f}"].append(n["id"])
+        self._ros_of_module = {m: ids[0] for m, ids in ros_files.items() if len(ids) == 1}
         self.evidence: dict[str, dict] = {ev["id"]: ev for ev in model.get("evidence", [])}
         self.by_subsystem: dict[str, list[str]] = defaultdict(list)
         for n in model["nodes"]:
@@ -120,7 +128,8 @@ class ModelView:
                 "state",
             ):
                 return nid
-            return self.module_of(nid)
+            mod = self.module_of(nid)
+            return self._ros_of_module.get(mod, mod)
         return nid
 
     def handler_of(self, endpoint: str) -> str | None:

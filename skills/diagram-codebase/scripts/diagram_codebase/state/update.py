@@ -2,8 +2,9 @@
 
 Reads manifest.json (previous revision), model.json, inventory.json, plan.json and
 findings/*.json from the output directory and runs read-only `git diff` via
-scan.gitinfo. Recommends `full` (re-run the whole analysis), `incremental`
-(re-analyze affected areas, regenerate affected diagrams) or `none`.
+scan.gitinfo. Recommends `full` (re-run the whole analysis), `partial`
+(re-analyze affected areas, regenerate affected diagrams) or `none`. Affected
+findings areas are named by slug (`execution`, `dataflow`, `sub-<slug>`, ...).
 """
 
 from __future__ import annotations
@@ -155,7 +156,7 @@ def affected(out_dir: Path | str, root: Path | str, config: dict[str, Any]) -> d
     elif not model:
         rec, reason = "full", "model.json is missing"
     else:
-        rec, reason = "incremental", f"{len(touched)} file(s) changed ({churn:.0%} churn)"
+        rec, reason = "partial", f"{len(touched)} file(s) changed ({churn:.0%} churn)"
         if build:
             reason += "; build/manifest files changed, re-run the scan before merging"
     return {
@@ -166,12 +167,20 @@ def affected(out_dir: Path | str, root: Path | str, config: dict[str, Any]) -> d
         "neighbor_nodes": sorted(hop),
         "affected_subsystems": sorted(subsystems),
         "findings_to_reanalyze": stale_findings,
+        "areas": _areas(stale_findings, subsystems),
         "affected_diagrams": diagrams,
         "build_files_changed": build,
         "churn": churn,
         "recommendation": rec,
         "reason": reason,
     }
+
+
+def _areas(stale_findings: list[dict[str, Any]], subsystems: set[str]) -> list[str]:
+    """Findings area slugs to re-analyze: stale findings files plus touched subsystems."""
+    areas = {Path(f["file"]).stem for f in stale_findings}
+    areas |= {"sub-" + sid.split(":", 1)[-1] for sid in subsystems}
+    return sorted(areas)
 
 
 def _rel_out(out_dir: Path, root: Path) -> str | None:

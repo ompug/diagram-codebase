@@ -48,6 +48,7 @@ class FakeFigma:
         self.calls: list[tuple[str, dict]] = []
         self.fail: dict[str, list[str]] = {}
         self.drop_labels: set[str] = set()  # titles whose shapes render without text
+        self.plans = [{"key": "team::123", "name": "Shop team", "tier": "pro"}]
 
     def _new(self, ntype: str, name: str, text: str = "", parent: str | None = None) -> str:
         self.seq += 1
@@ -84,7 +85,14 @@ class FakeFigma:
             raise RuntimeError(queued.pop(0))
         return getattr(self, tool)(params)
 
+    def whoami(self, p: dict) -> str:
+        assert p == {}
+        body = {"handle": "Fake User", "email": "fake@example.com", "plans": self.plans}
+        return json.dumps([{"type": "text", "text": json.dumps(body)}])
+
     def generate_diagram(self, p: dict) -> str:
+        if "planKey" in p:
+            assert re.fullmatch(r"(team|organization)::\d+", p["planKey"])
         if "INVALID" in p["mermaidSyntax"]:
             raise RuntimeError("Invalid Mermaid syntax: parse error on line 2")
         if "fileKey" in p:
@@ -185,7 +193,8 @@ class FakeFigma:
         return f'<{tag} id="{nid}" name="{html.escape(n["name"])}">{inner}</{tag}>'
 
     def get_figjam(self, p: dict) -> str:
-        assert p["fileKey"] == KEY
+        assert p["fileKey"] == KEY and p["nodeId"] == "0:1"
+        assert p["includeImagesOfNodes"] is False
         body = "".join(self._xml(n) for n in self.top)
         return f'<figjam fileKey="{KEY}"><page id="0:1" name="Page 1">{body}</page></figjam>'
 
@@ -267,6 +276,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("DIAGRAM_CODEBASE_CACHE", str(cache))
     config = copy.deepcopy(DEFAULTS)
     config["budget"].update(per_minute=100, per_day=1000)
+    config["figma"]["plan_key"] = "team::123"  # whoami flow has its own tests
     m = mf.new_manifest(repo_name="shop", repo_root=tmp_path, revision="abcdef1234567", options={})
     mf.save(out, m)
     write_plan(out, SPECS)
@@ -662,3 +672,71 @@ def test_hook_denied_call_consumes_no_attempt(env):
     assert m["diagrams"]["master"]["attempts"] == 0 and not m["diagrams"]["master"]["errors"]
     assert not [e for e in ledger.read_entries(env["cache"]) if e["event"] == "driver_estimate"]
     assert nxt(env)["kind"] == "generate_diagram"
+
+
+# ------------------------------------------------------------- whoami / planKey
+
+
+def _no_plan_key(env):
+    env["config"]["figma"]["plan_key"] = ""
+    return env
+
+
+def test_whoami_single_plan_sets_plan_key(env):
+    actions = run(_no_plan_key(env))
+    assert kinds(actions)[:3] == ["confirm", "whoami", "generate_diagram"]
+    gens = [p for t, p in env["fig"].calls if t == "generate_diagram"]
+    assert gens and all(p["planKey"] == "team::123" for p in gens)
+    m = manifest(env)
+    assert m["figma"]["plan_key"] == "team::123"
+    text = json.dumps(m)
+    assert "fake@example.com" not in text and "Fake User" not in text
+    assert actions[-1]["kind"] == "done"
+
+
+def test_whoami_several_plans_asks_user(env):
+    _no_plan_key(env)
+    env["fig"].plans = [
+        {"key": "team::1", "name": "Personal"},
+        {"key": "organization::2", "name": "Acme Org"},
+    ]
+    actions = run(env)
+    assert actions[-1]["kind"] == "ask_user"
+    assert "Acme Org (organization::2)" in actions[-1]["params"]["question"]
+    bad = rec(env, actions[-1], json.dumps({"answer": "something else"}))
+    assert bad["outcome"] == "error"
+    again = nxt(env)
+    assert again["kind"] == "ask_user"
+    assert rec(env, again, json.dumps({"answer": "acme org"}))["plan_key"] == "organization::2"
+    rest = run(env)
+    assert rest[-1]["kind"] == "done"
+    gens = [p for t, p in env["fig"].calls if t == "generate_diagram"]
+    assert all(p["planKey"] == "organization::2" for p in gens)
+
+
+def test_whoami_without_plans_generates_without_plan_key(env):
+    _no_plan_key(env)
+    env["fig"].plans = []
+    actions = run(env)
+    assert actions[-1]["kind"] == "done"
+    gens = [p for t, p in env["fig"].calls if t == "generate_diagram"]
+    assert gens and all("planKey" not in p for p in gens)
+    assert manifest(env)["figma"]["plan_checked"] is True
+
+
+def test_place_script_identifies_sections_by_name_prefix():
+    from diagram_codebase.figma import scripts
+
+    code = scripts.place_section(
+        diagram_id="master", title="Overview", run_id="r1", content_hash="h", row=0,
+        known_ids=["1:5"],
+    )  # fmt: skip
+    params = json.loads(re.match(r"const P = (\{.*?\});\n", code).group(1))
+    assert params["sectionName"] == scripts.SECTION_PREFIX + "Overview"
+    assert params["knownIds"] == ["1:5"]
+    assert "setPluginData(" not in code and "loadAllPagesAsync" not in code
+    assert "n.setSharedPluginData" in code and "try {" in code
+    legend = scripts.legend_and_index(
+        run_id="r1", categories=["app"], diagrams=[], repo_name="x", revision=None, date="d"
+    )
+    assert "setPluginData(" not in legend and json.dumps(scripts.LEGEND_NAME) in legend

@@ -11,19 +11,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..mermaid.lint import ARCH_DOTTED, ARCH_FORWARD, LANES
 from .graph import is_dag
 from .view import ModelView
 
-LANES = ("client", "gateway", "service", "datastore", "external", "async")
-ALLOWED = {
-    ("client", "gateway"),
-    ("gateway", "service"),
-    ("service", "service"),
-    ("service", "datastore"),
-    ("service", "async"),
-    ("async", "service"),
-    ("service", "external"),
-}
+# Single source of truth: the lane tables mermaid/lint.py enforces.
+ALLOWED = ARCH_FORWARD | ARCH_DOTTED
+__all__ = ["ALLOWED", "LANES", "check", "lane_of"]
 GATEWAY_HINTS = (
     "nginx",
     "gateway",
@@ -64,7 +58,8 @@ def check(
     lanes = {u: lane_of(view, u) for u in units}
     if len(edges) > max_edges:
         reasons.append(f"{len(edges)} edges > {max_edges}")
-    seen_pairs = set()
+    seen_pairs: set[frozenset[str]] = set()
+    directed: set[tuple[str, str]] = set()
     forward = []
     for e in edges:
         pair = (lanes[e["from"]], lanes[e["to"]])
@@ -74,8 +69,15 @@ def check(
             )
         key = frozenset((e["from"], e["to"]))
         if key in seen_pairs:
-            reasons.append(f"two edges between {view.label(e['from'])} and {view.label(e['to'])}")
+            # A unit that both produces to and consumes from a channel draws two dotted
+            # edges in opposite directions; Figma's rules allow that pair.
+            opposite = (e["to"], e["from"]) in directed and "async" in pair
+            if not opposite:
+                reasons.append(
+                    f"two edges between {view.label(e['from'])} and {view.label(e['to'])}"
+                )
         seen_pairs.add(key)
+        directed.add((e["from"], e["to"]))
         if "async" not in pair and "external" not in pair:
             forward.append((e["from"], e["to"]))
     if not is_dag(units, forward):

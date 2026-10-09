@@ -771,3 +771,49 @@ def render(spec: dict[str, Any], redactor: Redactor | None = None) -> str:
         return display_label(text, redactor=redactor)
 
     return _RENDERERS[renderer](spec, lab)
+
+
+# --- helpers for dc.py plan -------------------------------------------------------------
+
+_LANE_CATEGORY = {
+    "client": "app", "gateway": "infra", "service": "app", "datastore": "data",
+    "external": "external", "async": "messaging",
+}  # fmt: skip
+
+
+def architecture_fallback(spec: dict[str, Any]) -> dict[str, Any]:
+    """Plain `flowchart LR` version of an architecture spec: one subgraph per lane.
+
+    Figma's architecture layout can reject a diagram; the driver retries with this text.
+    """
+    lanes = spec.get("lanes") or {}
+    used = [lane for lane in LANES if lane in set(lanes.values())]
+    out = {k: v for k, v in spec.items() if k != "lanes"}
+    out["renderer"] = "flowchart"
+    out["direction"] = "LR"
+    out["groups"] = [
+        {"id": f"lane-{lane}", "label": LANE_LABELS[lane], "parent": None,
+         "category": _LANE_CATEGORY[lane]}
+        for lane in used
+    ]  # fmt: skip
+    out["nodes"] = [
+        {**n, "group": f"lane-{lanes[str(n['id'])]}" if str(n["id"]) in lanes else None}
+        for n in spec.get("nodes", [])
+    ]
+    return out
+
+
+def long_labels(spec: dict[str, Any], max_len: int = MAX_LABEL) -> list[str]:
+    """Labels that render shortened to `max_len` characters (for the spec's `notes`)."""
+    raw: list[Any] = [spec.get("title")]
+    for key in ("nodes", "edges", "groups", "participants", "messages", "states", "transitions",
+                "relations", "entities"):  # fmt: skip
+        raw += [item.get("label") for item in spec.get(key) or [] if isinstance(item, dict)]
+    out: list[str] = []
+    for text in raw:
+        if not text:
+            continue
+        full = display_label(text, max_len=10**6)
+        if len(full) > max_len and full not in out:
+            out.append(full)
+    return out

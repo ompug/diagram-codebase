@@ -60,6 +60,9 @@ DEFAULTS: dict[str, Any] = {
         "max_attempts_per_diagram": 2,
         "section_gap": 200,
         "plugin_data_namespace": "diagramcodebase",
+        # Figma plan for new files ("team::123" / "organization::123"). Empty: the
+        # driver asks `whoami` and, with several plans, the user.
+        "plan_key": "",
     },
 }
 

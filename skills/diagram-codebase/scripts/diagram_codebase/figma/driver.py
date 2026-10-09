@@ -6,7 +6,7 @@ to `record`. Counted actions are persisted as `pending_action` before they are
 returned, so a crash between the two leaves an *uncertain* action that is
 reconciled (get_figjam, or asking the user when no file exists yet) before any retry.
 
-Publish order: confirm -> per diagram (priority order) generate_diagram then
+Publish order: confirm -> whoami (planKey; ask_user when several plans) -> per diagram (priority order) generate_diagram then
 use_figma place_section -> legend -> delete obsolete sections -> get_figjam verify ->
 get_screenshot for mismatches (or all with --verify-visual) -> done.
 """
@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from ..common import DCError, read_json, sha256_text, utc_now
+from ..mermaid import build
 from ..state import manifest as mf
 from . import ledger, ratelimit, scripts
 
@@ -39,6 +40,8 @@ SKILLS = {
 }
 _BOARD_RE = re.compile(r"https?://(?:www\.)?figma\.com/board/([A-Za-z0-9]+)(?:/[^\s\"'<>)\]\\]*)?")
 _RETRYABLE_STOPS = ("budget", "rate_limit")
+_PLAN_KEY_RE = re.compile(r"\b(?:team|organization)::\d+\b")
+FIGJAM_ROOT = "0:1"
 
 
 @dataclass
@@ -280,6 +283,9 @@ def _decide(ctx: Ctx, m: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]
             d["status"] = "failed"
             mf.add_event(m, "failed", f"{did}: no attempts left", diagram=did)
             continue
+        plan_action = _plan_key_action(ctx, m)
+        if plan_action is not None:
+            return plan_action
         return _generate_action(ctx, m, specs[did], did)
 
     legend = _legend_action(ctx, m, specs)
@@ -473,6 +479,9 @@ def _generate_action(ctx: Ctx, m: dict[str, Any], spec: dict[str, Any], did: str
     }
     if m["figma"]["file_key"]:
         params["fileKey"] = m["figma"]["file_key"]
+    plan_key = _plan_key(ctx, m)
+    if plan_key:
+        params["planKey"] = plan_key
     if d.get("renderer") == "architecture" and not fallback:
         params["useArchitectureLayoutCode"] = ARCH_LAYOUT_CODE
     d["fallback_used"] = fallback
@@ -502,6 +511,7 @@ def _place_action(ctx: Ctx, m: dict[str, Any], did: str) -> dict[str, Any]:
         row=d.get("row", 0),
         ignore_ids=m["figma"]["ignore_ids"],
         replace_section_id=d.get("replaced_section_id"),
+        known_ids=sorted(_known_ids(m) - {d.get("replaced_section_id")}),
         gap=int(ctx.config["figma"]["section_gap"]),
     )
     replacing = " replacing its previous version" if d.get("replaced_section_id") else ""
@@ -556,10 +566,47 @@ def _ask_file_url(ctx: Ctx, m: dict[str, Any], did: str) -> dict[str, Any]:
 
 
 def _figjam_params(m: dict[str, Any]) -> dict[str, Any]:
-    params: dict[str, Any] = {"fileKey": m["figma"]["file_key"]}
-    if int((m.get("verify") or {}).get("attempts") or 0) == 0:
-        params["nodeId"] = "0:1"  # the board's page; dropped after a failed attempt
-    return params
+    # fileKey and nodeId are both required; images are never needed for verification.
+    return {"fileKey": m["figma"]["file_key"], "nodeId": FIGJAM_ROOT, "includeImagesOfNodes": False}
+
+
+# ----------------------------------------------------------------- plan key
+
+
+def _plan_key(ctx: Ctx, m: dict[str, Any]) -> str | None:
+    configured = str(ctx.config["figma"].get("plan_key") or "").strip()
+    return configured or m["figma"].get("plan_key")
+
+
+def _plan_key_action(ctx: Ctx, m: dict[str, Any]) -> dict[str, Any] | None:
+    """generate_diagram wants planKey when authenticated: learn it via whoami (exempt)."""
+    fig = m["figma"]
+    if _plan_key(ctx, m) or fig.get("plan_checked"):
+        return None
+    choices = fig.get("plan_choices") or []
+    if len(choices) > 1:
+        listing = "; ".join(f"{c.get('name') or 'unnamed'} ({c['key']})" for c in choices)
+        return _emit(
+            ctx,
+            m,
+            kind="ask_user",
+            tool=None,
+            params={"question": f"Which Figma plan should own the new FigJam file? {listing}"},
+            purpose="ask_plan",
+            explain="Your Figma account has several plans; ask which one to create diagrams in.",
+            record_hint='Write the user\'s choice (plan name or key) as {"answer": "..."} to '
+            "a file, then run: python3 dc.py record --action {id} --result-file <file>",
+        )
+    return _emit(
+        ctx,
+        m,
+        kind="whoami",
+        tool="whoami",
+        params={},
+        purpose="whoami",
+        explain="Looking up your Figma plan (generate_diagram needs its planKey). "
+        "Not counted against the rate limit.",
+    )
 
 
 def _categories(specs: dict[str, dict[str, Any]], ids: list[str]) -> list[str]:
@@ -686,7 +733,9 @@ def _screenshot_action(ctx: Ctx, m: dict[str, Any]) -> dict[str, Any] | None:
             purpose="screenshot",
             diagram_id=did,
             explain=f"Visual check of '{d['title']}'.",
-            record_hint="Look at the screenshot. Write one or two sentences to a file starting "
+            record_hint="The result holds a short-lived image URL: download it (curl -sSL -o "
+            "<out>/publish/results/{id}.png '<url>') and Read the PNG. Never paste the URL "
+            "anywhere else. Write one or two sentences to a file starting "
             "with 'OK:' if the section shows the diagram with readable labels, else "
             "'PROBLEM:' and what is wrong; then run: python3 dc.py record --action {id} "
             "--result-file <file>",
@@ -1113,14 +1162,19 @@ def expected_labels(spec: dict[str, Any] | None, mermaid: str = "") -> list[str]
     """Labels a reader should find in the rendered diagram (from the spec, else Mermaid)."""
     spec = spec or {}
     renderer = spec.get("renderer")
-    if renderer == "sequence":
-        raw = [p.get("label") or p.get("id") for p in spec.get("participants") or []]
-    elif renderer == "erd":
-        raw = [e.get("id") for e in spec.get("entities") or []]
-    elif renderer == "state":
-        raw = [s.get("label") or s.get("id") for s in spec.get("states") or []]
-    else:
-        raw = [n.get("label") for n in spec.get("nodes") or []]
+    raw: list[Any] = []
+    try:
+        if renderer in ("sequence", "erd"):
+            # Participants and entities render under their Mermaid ids.
+            raw = list(build.id_map(spec).values())
+        elif renderer == "state":
+            raw = [
+                build.display_label(s.get("label") or s.get("id")) for s in spec.get("states") or []
+            ]
+        elif spec.get("nodes"):
+            raw = [build.display_label(n.get("label") or n.get("id")) for n in spec["nodes"]]
+    except (KeyError, TypeError, ValueError):
+        raw = []
     labels = [r for r in raw if isinstance(r, str)]
     if not labels and mermaid:
         labels = [q or u for q, u in _MMD_LABEL_RE.findall(mermaid)]
@@ -1189,9 +1243,83 @@ def _on_reconcile(ctx, m, plan, pa, result, error) -> dict[str, Any]:
     return {"outcome": "ok", "diagram_id": did, "status": d["status"], "landed": False}
 
 
+def _answer(result: str) -> str:
+    """The user's reply: `{"answer": "..."}` (documented form) or the raw text."""
+    text = (result or "").strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return text
+        if isinstance(data, dict) and "answer" in data:
+            return str(data.get("answer") or "").strip()
+    return text
+
+
+def _plans_in(result: str) -> list[dict[str, str]]:
+    """Plans `[{key, name}]` from a whoami result. Never keeps the email or handle."""
+    plans: list[dict[str, str]] = []
+    obj = _find_obj(result, "plans")
+    for item in (obj or {}).get("plans") or []:
+        if not isinstance(item, dict):
+            continue
+        key = next((str(item[k]) for k in ("key", "planKey", "plan_key") if item.get(k)), "")
+        if _PLAN_KEY_RE.fullmatch(key) and key not in {p["key"] for p in plans}:
+            plans.append({"key": key, "name": str(item.get("name") or "")[:80]})
+    if not plans:
+        for key in dict.fromkeys(_PLAN_KEY_RE.findall(result or "")):
+            plans.append({"key": key, "name": ""})
+    return plans
+
+
+def _on_whoami(ctx, m, plan, pa, result, error) -> dict[str, Any]:
+    fig = m["figma"]
+    cls, text = _classify(result, error)
+    if cls is not None:
+        common = _common_failure(ctx, m, cls, text, "looking up your Figma plan")
+        if common:
+            return common
+        fig["plan_checked"] = True
+        mf.add_event(m, "warning", "whoami failed; generating without planKey", error=text[:200])
+        return {"outcome": "error", "class": cls, "explain": "continuing without planKey"}
+    plans = _plans_in(result)
+    if len(plans) == 1:
+        fig["plan_key"] = plans[0]["key"]
+        return {"outcome": "ok", "plan_key": fig["plan_key"]}
+    if not plans:
+        fig["plan_checked"] = True
+        mf.add_event(m, "warning", "whoami listed no plans; generating without planKey")
+        return {"outcome": "ok", "plan_key": None}
+    fig["plan_choices"] = plans
+    return {"outcome": "ok", "plan_key": None, "explain": "several plans; asking the user"}
+
+
+def _on_ask_plan(ctx, m, plan, pa, result, error) -> dict[str, Any]:
+    fig = m["figma"]
+    reply = _answer(result)
+    choices = fig.get("plan_choices") or []
+    keys = _PLAN_KEY_RE.findall(reply)
+    chosen = next((c["key"] for c in choices if c["key"] in keys), None)
+    if chosen is None:
+        low = reply.lower()
+        named = [c["key"] for c in choices if c.get("name") and c["name"].lower() == low]
+        named = named or [c["key"] for c in choices if c.get("name") and low in c["name"].lower()]
+        chosen = named[0] if len(named) == 1 else None
+    if chosen is None:
+        return {
+            "outcome": "error",
+            "class": "invalid_request",
+            "explain": "reply did not name one of the listed plans; asking again",
+        }
+    fig["plan_key"] = chosen
+    fig.pop("plan_choices", None)
+    return {"outcome": "ok", "plan_key": chosen}
+
+
 def _on_ask_file_url(ctx, m, plan, pa, result, error) -> dict[str, Any]:
     did = pa["diagram_id"]
     d = m["diagrams"][did]
+    result = _answer(result)
     found = board_key(result)
     m["uncertain"] = None
     if found:
@@ -1295,4 +1423,6 @@ _HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "reconcile_generate": _on_reconcile,
     "screenshot": _on_screenshot,
     "ask_file_url": _on_ask_file_url,
+    "whoami": _on_whoami,
+    "ask_plan": _on_ask_plan,
 }

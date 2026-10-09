@@ -41,6 +41,7 @@ DATA_KINDS = {
 }  # fmt: skip
 # Edge kinds that have their own diagram and would only clutter the master.
 MASTER_EXCLUDE = {"tf_transform", "config_dependency"}
+DEPLOY_EDGE_KINDS = {"depends_on", "launches"}
 EXEC_EXPAND = {"calls", "instantiates", "spawns", "triggers", "handles", "publishes", "api_request"}
 EXEC_LEAF = {"db_read", "db_write", "db_access", "external_call", "service_call", "action_call"}
 ROS_EDGE_KINDS = {
@@ -330,13 +331,20 @@ class _Planner:
             sid for sid in sorted(v.subsystems) if v.significant_in(sid, SYMBOL_KINDS | {"module"})
         ]
         level = "subsystem" if len(sig_subs) >= 3 else "module"
-        units, edges = v.aggregate(level, exclude_kinds=MASTER_EXCLUDE)
+        exclude = set(MASTER_EXCLUDE)
+        if self.model.get("dataflows") and self.wants("dataflow"):
+            exclude.add("data_flow")  # data artifacts get their own data-flow diagram
+        if self._deployment_units() >= 2:
+            # Deployment wiring has its own diagram; mixing it with code boxes in the
+            # overview puts two abstraction levels side by side.
+            exclude |= DEPLOY_EDGE_KINDS
+        units, edges = v.aggregate(level, exclude_kinds=exclude)
         if level == "subsystem" and len(units) < lo:
-            mu, me = v.aggregate("module", exclude_kinds=MASTER_EXCLUDE)
+            mu, me = v.aggregate("module", exclude_kinds=exclude)
             if len(mu) <= hi:
                 level, units, edges = "module", mu, me
         elif level == "module" and len(units) > hi and len(v.subsystems) >= 2:
-            su, se = v.aggregate("subsystem", exclude_kinds=MASTER_EXCLUDE)
+            su, se = v.aggregate("subsystem", exclude_kinds=exclude)
             if len(su) >= 3:
                 level, units, edges = "subsystem", su, se
         if len(units) < 2:
@@ -345,6 +353,17 @@ class _Planner:
             )
             return
         units, edges, notes = self._fit(units, edges, max_nodes=hi)
+        # Package `__init__` files reached only through imports carry no architecture.
+        linked = {x for e in edges if not e.get("import_only") for x in (e["from"], e["to"])}
+        inits = [
+            u
+            for u in units
+            if v.kind_of(u) == "module" and u.endswith("__init__.py") and u not in linked
+        ]
+        if inits and len(units) - len(inits) >= 2:
+            units = [u for u in units if u not in inits]
+            edges = [e for e in edges if e["from"] in units and e["to"] in units]
+            notes.append(f"{len(inits)} package __init__ module(s) with only imports omitted")
         members = v.members(level, units)
         repo = ((self.model.get("meta") or {}).get("repo") or {}).get("name") or "System"
         title = f"{repo} system overview"
@@ -429,8 +448,44 @@ class _Planner:
                     did,
                 )
                 continue
-            for j, spec in enumerate(self._subsystem_specs(sid, did)):
+            specs = self._subsystem_specs(sid, did)
+            master = self.master_spec()
+            if len(specs) == 1 and master is not None and not self._adds_detail(specs[0], sid):
+                self.skip("subsystem", f"{v.label(sid)} adds no detail beyond 'master'", did)
+                continue
+            for j, spec in enumerate(specs):
                 self.add(spec, "subsystem", i * 100 + j)
+
+    def master_spec(self) -> dict[str, Any] | None:
+        return next((d for d in self.candidates if d["id"] == "master"), None)
+
+    def _adds_detail(self, spec: dict[str, Any], sid: str) -> bool:
+        """True when the subsystem diagram draws its own content with more boxes than master."""
+        inside = {n for n, node in self.v.nodes.items() if node.get("subsystem") == sid}
+
+        def count(d: dict[str, Any]) -> int:
+            return sum(1 for n in d["nodes"] if inside & set(n.get("model_ids") or []))
+
+        master = self.master_spec()
+        return master is None or count(spec) > count(master)
+
+    def covered_by(
+        self, spec: dict[str, Any], slack: int = 3, any_level: bool = False
+    ) -> str | None:
+        """Id of a planned diagram at the same level that already draws every node and
+        connection of `spec` with at most `slack` extra boxes (the same picture twice)."""
+        nodes = {n["id"] for n in spec["nodes"]}
+        pairs = {frozenset((e["from"], e["to"])) for e in spec["edges"]}
+        for d in self.candidates:
+            if not any_level and d.get("level") != spec.get("level"):
+                continue
+            if len(d["nodes"]) > len(nodes) + slack:
+                continue
+            if nodes <= {n["id"] for n in d["nodes"]} and pairs <= {
+                frozenset((e["from"], e["to"])) for e in d["edges"]
+            }:
+                return d["id"]
+        return None
 
     def _subsystem_specs(self, sid: str, did: str) -> list[dict[str, Any]]:
         v = self.v
@@ -579,6 +634,12 @@ class _Planner:
                 "dataflow-derived",
             )
             return
+        dup = self.covered_by(spec)
+        if dup:
+            self.skip(
+                "dataflow", f"every data path is already drawn in '{dup}'", "dataflow-derived"
+            )
+            return
         self.add(spec, "dataflow")
 
     def _data_edges(self, level: str) -> tuple[list[str], list[dict[str, Any]]]:
@@ -712,8 +773,12 @@ class _Planner:
         traces.sort(key=lambda t: (t[0], t[1]))
         limit = 3 if self.depth == "deep" else 1
         added = 0
-        for _neg, ep, units, edges, phase_of, notes in traces:
-            did = f"execution-{slug(v.label(ep))}"
+        names = Counter(v.label(ep) for _n, ep, *_rest in traces)
+        for _neg, ep, units, edges, _phase_of, notes in traces:
+            name = v.label(ep)
+            if names[name] > 1:  # e.g. several main() functions: qualify by module
+                name = f"{v.label(v.module_of(ep))} {name}"
+            did = f"execution-{slug(name)}"
             if len(units) < 4:
                 self.skip(
                     "execution",
@@ -734,8 +799,18 @@ class _Planner:
                 did=did, typ="execution", title=f"Execution from {v.label(ep)}",
                 purpose=f"What runs, in order, after the entry point {v.label(ep)} starts.",
                 level="symbol", units=units, edges=edges, notes=notes + fit_notes, direction="TD",
-                group_of=_phase_groups(phase_of, units), shape=shape, min_group=1,
+                shape=shape,
             )  # fmt: skip
+            # No Initialization/Runtime boxes here: a scanned edge's phase says when the
+            # relationship is set up (e.g. handler registration), not when the target runs.
+            dup = self.redundant_with(spec["model_nodes"])
+            reason = f"overlaps '{dup}' by more than 80%"
+            if not dup:
+                dup = self.covered_by(spec)
+                reason = f"is already fully drawn in '{dup}'"
+            if dup:
+                self.skip("execution", f"execution from {v.label(ep)} {reason}", did)
+                continue
             self.add(spec, "execution" if added == 0 else "extra", added)
             added += 1
 
@@ -859,13 +934,25 @@ class _Planner:
                 "LR",
                 "module",
             )
-            spec["participants"] = [{"id": p, "label": v.label(p)} for p in parts]
+            spec["participants"] = [{"id": p, "label": self._participant_label(p)} for p in parts]
             spec["messages"] = msgs
             members = v.members("module", parts)
             spec["model_nodes"] = sorted({m for p in parts for m in members.get(p, [])})
             spec["notes"] = notes + _long_label_notes(p["label"] for p in spec["participants"])
             self.add(spec, "sequence" if added == 0 else "extra", added)
             added += 1
+
+    def _participant_label(self, uid: str) -> str:
+        """Module participants carry their subsystem name when there are several
+        (`api.js` -> `Frontend api`), so generic file names stay unambiguous."""
+        v = self.v
+        label = v.label(uid)
+        sid = (v.nodes.get(uid) or {}).get("subsystem")
+        if v.kind_of(uid) != "module" or not sid or len(v.subsystems) < 2:
+            return label
+        sub = v.label(sid)
+        stem = label.rsplit(".", 1)[0] if "." in label else label
+        return label if sub.lower() in stem.lower() else f"{sub} {stem}"
 
     def _flow_messages(self, flow: dict[str, Any]):
         v = self.v
@@ -1141,6 +1228,14 @@ class _Planner:
             category=category, members=v.members(level, units, scope=self.scope),
         )  # fmt: skip
 
+    def _deployment_units(self) -> int:
+        """Deployment units the infrastructure diagram will draw (0 when it is not planned)."""
+        if not self.wants("infrastructure") or (
+            self.scope is not None and "infrastructure" not in self.types
+        ):
+            return 0
+        return sum(1 for node in self.v.nodes.values() if node["kind"] == "deployment_unit")
+
     def _infrastructure(self) -> None:
         v = self.v
         if self.scope is not None and "infrastructure" not in self.types:
@@ -1298,6 +1393,10 @@ class _Planner:
                 purpose="Which ROS 2 nodes publish, subscribe, call and serve which topics, services and actions.",
                 level="symbol", units=punits, edges=pedges, notes=notes + fit_notes, group_of=group_of,
             )  # fmt: skip
+            dup = self.covered_by(spec, any_level=True) if len(parts) == 1 else None
+            if dup:
+                self.skip("ros2", f"every node and connection is already drawn in '{dup}'", did)
+                continue
             self.add(spec, "ros2-graph", k)
 
     def _ros2_tf(self) -> None:

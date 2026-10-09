@@ -109,7 +109,7 @@ def test_no_changes(repo):
     assert res["recommendation"] == "none" and res["changed_count"] == 0
 
 
-def test_incremental_change(repo):
+def test_partial_change(repo):
     root, out = repo
     (root / "app" / "service.py").write_text("def restock():\n    return 1\n")
     res = update.affected(out, root, CONFIG)
@@ -120,7 +120,7 @@ def test_incremental_change(repo):
         {"file": "findings/execution.json", "cites": ["app/service.py"]}
     ]
     assert res["affected_diagrams"] == ["master"]
-    assert res["recommendation"] == "incremental"
+    assert res["recommendation"] == "partial"
     assert res["build_files_changed"] == []
 
 

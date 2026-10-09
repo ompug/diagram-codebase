@@ -20,6 +20,11 @@ from typing import Any
 
 NAMESPACE = "diagramcodebase"
 SKILL_NAMES = "figma-use,figma-use-figjam"
+# Our sections are also recognizable by name, so idempotency survives when shared
+# plugin data is unavailable (use_figma forbids setPluginData; sharedPluginData is
+# used but every access is wrapped in try/catch).
+SECTION_PREFIX = "DC \u00b7 "
+LEGEND_NAME = SECTION_PREFIX + "Legend and Index"
 PAD = 48  # >= 32 px padding required by create-section guidance
 TITLE_SPACE = 88  # H2 (40 px) title line plus breathing room
 
@@ -46,8 +51,11 @@ const CHARCOAL = h(0x1e, 0x1e, 0x1e);
 const FONT = { family: "Inter", style: "Medium" };
 const page = figma.currentPage;
 const errors = [];
+const PREFIX = P.prefix;
 const tag = (n, k) => { try { return n.getSharedPluginData(NS, k) || ""; } catch (e) { return ""; } };
-const ours = (n) => n.type === "SECTION" && (tag(n, "kind") !== "" || tag(n, "diagram_id") !== "");
+const setTag = (n, k, v) => { try { n.setSharedPluginData(NS, k, v); return true; } catch (e) { errors.push("sharedPluginData unavailable: " + String(e)); return false; } };
+const named = (n) => typeof n.name === "string" && n.name.startsWith(PREFIX);
+const ours = (n) => n.type === "SECTION" && (tag(n, "kind") !== "" || tag(n, "diagram_id") !== "" || named(n));
 const box = (n) => ({ x: Math.round(n.x), y: Math.round(n.y), width: Math.round(n.width), height: Math.round(n.height) });
 function textsIn(root, limit) {
   const out = [];
@@ -103,8 +111,11 @@ function fitSection(section, pad) {
 """
 
 _PLACE_BODY = """\
+const known = new Set(P.knownIds);
 for (const n of page.children) {
-  if (ours(n) && tag(n, "diagram_id") === P.diagramId && tag(n, "content_hash") === P.contentHash && tag(n, "run_id") === P.runId) {
+  const tagged = tag(n, "diagram_id") === P.diagramId && tag(n, "content_hash") === P.contentHash && tag(n, "run_id") === P.runId;
+  const byName = tag(n, "diagram_id") === "" && n.type === "SECTION" && n.name === P.sectionName && n.id !== P.replaceSectionId && !known.has(n.id);
+  if (ours(n) && (tagged || byName)) {
     return { sectionId: n.id, reused: true, alreadyPlaced: true, createdNodeIds: [], movedNodeIds: [], removedSectionIds: [],
       foreignTopLevelIds: [], texts: textsIn(n, 80), bounds: box(n), errors };
   }
@@ -159,15 +170,15 @@ const title = await makeText(P.title, 40, 0);
 section.appendChild(title);
 title.x = P.pad;
 title.y = P.pad;
-title.setSharedPluginData(NS, "role", "title");
+setTag(title, "role", "title");
 created.push(title.id);
-section.name = P.title;
+section.name = P.sectionName;
 section.fills = [{ type: "SOLID", color: hex(P.fill) }];
 fitSection(section, P.pad);
 section.x = tx;
 section.y = ty;
 const tags = { kind: "diagram", diagram_id: P.diagramId, run_id: P.runId, content_hash: P.contentHash, row: String(P.row) };
-for (const k of Object.keys(tags)) section.setSharedPluginData(NS, k, tags[k]);
+for (const k of Object.keys(tags)) if (!setTag(section, k, tags[k])) break;
 const removed = [];
 if (old && old.type === "SECTION" && old.id !== section.id) { removed.push(old.id); old.remove(); }
 return { sectionId: section.id, reused, alreadyPlaced: false, createdNodeIds: created, movedNodeIds: moved,
@@ -178,12 +189,12 @@ return { sectionId: section.id, reused, alreadyPlaced: false, createdNodeIds: cr
 _LEGEND_BODY = """\
 const removed = [];
 for (const n of page.children.slice()) {
-  if (ours(n) && tag(n, "kind") === "legend") { removed.push(n.id); n.remove(); }
+  if (ours(n) && (tag(n, "kind") === "legend" || n.name === P.legendName)) { removed.push(n.id); n.remove(); }
 }
 const created = [];
 const section = figma.createSection();
 created.push(section.id);
-section.name = "Legend and Index";
+section.name = P.legendName;
 section.fills = [{ type: "SOLID", color: hex("F9F9F9") }];
 let y = P.pad;
 const place = (node) => { section.appendChild(node); node.x = P.pad; node.y = y; y += node.height + 32; created.push(node.id); };
@@ -211,13 +222,12 @@ for (let r = 0; r * cols < stickies.length; r++) {
 place(await makeText("Diagrams", 24, 0));
 if (P.index) place(await makeText(P.index, 16, 720));
 fitSection(section, P.pad);
-const mine = page.children.filter((n) => ours(n) && tag(n, "kind") === "diagram");
+const mine = page.children.filter((n) => ours(n) && n.id !== section.id && tag(n, "kind") !== "legend" && n.name !== P.legendName);
 const row0 = mine.filter((n) => tag(n, "row") === "0");
 const anchorY = (row0.length ? row0 : mine).map((n) => n.y);
 section.x = mine.length ? Math.min(...mine.map((n) => n.x)) - P.gap - section.width : 0;
 section.y = anchorY.length ? Math.min(...anchorY) : 0;
-section.setSharedPluginData(NS, "kind", "legend");
-section.setSharedPluginData(NS, "run_id", P.runId);
+if (setTag(section, "kind", "legend")) setTag(section, "run_id", P.runId);
 return { sectionId: section.id, createdNodeIds: created, removedSectionIds: removed, bounds: box(section), errors };
 """
 
@@ -247,12 +257,16 @@ def place_section(
     row: int,
     ignore_ids: list[str] | None = None,
     replace_section_id: str | None = None,
+    known_ids: list[str] | None = None,
     gap: int = 200,
 ) -> str:
     """Wrap the newest generated diagram in a tagged, titled section on the row grid."""
     params = {
         "diagramId": diagram_id,
         "title": title,
+        "sectionName": SECTION_PREFIX + title,
+        "prefix": SECTION_PREFIX,
+        "knownIds": sorted(known_ids or []),
         "runId": run_id,
         "contentHash": content_hash or "",
         "row": int(row),
@@ -290,6 +304,8 @@ def legend_and_index(
     ]
     params = {
         "runId": run_id,
+        "prefix": SECTION_PREFIX,
+        "legendName": LEGEND_NAME,
         "meta": f"{repo_name} @ {rev}, generated {date}\n{note}",
         "categories": cats,
         "index": "\n".join(lines),
@@ -304,10 +320,17 @@ def delete_sections(ids: list[str]) -> str:
     return _params({"ids": sorted(set(ids))}) + _DELETE_BODY
 
 
+MAX_CODE = 50_000
+MAX_DESCRIPTION = 2_000
+
+
 def use_figma_params(file_key: str, code: str, description: str) -> dict[str, Any]:
+    """Exact use_figma arguments (code <= 50,000 chars, description <= 2,000)."""
+    if len(code) > MAX_CODE:
+        raise ValueError(f"use_figma script is {len(code)} chars (limit {MAX_CODE})")
     return {
         "fileKey": file_key,
         "code": code,
-        "description": description,
+        "description": description[:MAX_DESCRIPTION],
         "skillNames": SKILL_NAMES,
     }

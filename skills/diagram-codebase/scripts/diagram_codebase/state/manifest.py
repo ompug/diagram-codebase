@@ -253,12 +253,14 @@ def init_run(
         existing["options"] = {**existing.get("options", {}), **_sticky(options)}
         return existing, "resume"
     m = new_manifest(repo_name=name, repo_root=repo_root, revision=revision, options=options)
-    if existing is not None and options.get("update"):
+    if existing is not None:
+        # Keep the FigJam file and its sections: reconcile_plan then marks unchanged
+        # diagrams as kept, changed ones stale and removed ones obsolete.
         m["figma"] = existing["figma"]
         m["diagrams"] = existing["diagrams"]
-        m["previous_revision"] = existing.get("revision")
-        m["confirmed"] = False
-        return m, "update"
+        if options.get("update"):
+            m["previous_revision"] = existing.get("revision")
+            return m, "update"
     return m, "fresh"
 
 

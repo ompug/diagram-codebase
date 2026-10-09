@@ -198,7 +198,9 @@ def test_fixture_a_master_shows_main_path(fixture_a_model):
     assert e[("mod:app/forecast.py", "mod:app/models.py")]["label"] == "imports"
     assert e[("mod:app/service.py", "mod:app/repository.py")]["style"] == "solid"
     assert "subsystem-app" in ds and ds["subsystem-app"]["level"] == "symbol"
-    assert "execution-main" in ds
+    # The derived execution trace covers the same symbols as subsystem-app: skipped.
+    skipped = {x.get("id"): x["reason"] for x in plan["skipped"]}
+    assert "execution-main" not in ds and "overlaps 'subsystem-app'" in skipped["execution-main"]
     # Every diagram has a purpose; content_hash left for dc.py plan.
     assert all(d["purpose"] and d["content_hash"] == "" for d in plan["diagrams"])
     cov = plan["coverage"]
@@ -489,7 +491,7 @@ def exec_model():
     )
 
 
-def test_derived_execution_from_function_entrypoint_with_phases():
+def test_derived_execution_from_function_entrypoint():
     plan = plan_diagrams(exec_model(), opts(types=["execution"]), cfg())
     ex = by_id(plan)["execution-main"]
     assert ex["direction"] == "TD" and ex["row"] == 2
@@ -498,11 +500,9 @@ def test_derived_execution_from_function_entrypoint_with_phases():
     assert {"store:db", "fn:app/svc.py:step_a"} <= ids
     shapes = {n["id"]: n["shape"] for n in ex["nodes"]}
     assert shapes["fn:app/main.py:main"] == "stadium"
-    groups = {g["label"]: g["id"] for g in ex["groups"]}
-    assert set(groups) == {"Initialization", "Runtime"}
-    grp = {n["id"]: n["group"] for n in ex["nodes"]}
-    assert grp["fn:app/main.py:setup"] == groups["Initialization"]
-    assert grp["fn:app/svc.py:step_a"] == groups["Runtime"]
+    # Derived traces are not boxed by phase: a scanned edge's phase records when a
+    # relationship is set up, not when its target runs.
+    assert not any(g["label"] in ("Initialization", "Runtime") for g in ex["groups"])
 
 
 def test_trace_orders_children_by_evidence_line():
@@ -590,7 +590,8 @@ def test_derived_sequence_web_request_chain():
     seq = by_id(plan)["sequence-get-api-todos"]
     assert seq["renderer"] == "sequence"
     labels = [p["label"] for p in seq["participants"]]
-    assert labels == ["api.js", "routes.py", "repo.py", "PostgreSQL"]
+    # Module participants carry their subsystem when there are several.
+    assert labels == ["Web api", "Srv routes", "Srv repo", "PostgreSQL"]
     msgs = [
         (m["from"].split("/")[-1], m["to"].split("/")[-1], m["label"], m["kind"])
         for m in seq["messages"]
@@ -781,10 +782,14 @@ def ros_model():
 
 
 def test_ros2_graph_and_tf_priority_after_master():
-    plan = plan_diagrams(ros_model(), opts(), cfg())
+    full = plan_diagrams(ros_model(), opts(), cfg())
+    assert not any(n["id"].startswith("tf:") for n in by_id(full)["master"]["nodes"])
+    # This small ROS master already draws every node and topic: the graph is redundant.
+    skipped = {x.get("id"): x["reason"] for x in full["skipped"]}
+    assert "already drawn in 'master'" in skipped["ros2-graph"]
+    plan = plan_diagrams(ros_model(), opts(types=["ros2"]), cfg())
     ids = [d["id"] for d in plan["diagrams"]]
-    assert ids[0] == "master" and ids[1] == "ros2-graph"
-    assert not any(n["id"].startswith("tf:") for n in by_id(plan)["master"]["nodes"])
+    assert ids[0] == "ros2-graph"
     graph = by_id(plan)["ros2-graph"]
     assert graph["row"] == 4
     shapes = {n["id"]: n["shape"] for n in graph["nodes"]}
