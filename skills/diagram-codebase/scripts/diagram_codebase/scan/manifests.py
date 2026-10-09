@@ -332,12 +332,21 @@ def _load_toml(text: str) -> dict:
 
 
 def _toml_fallback(text: str) -> dict:
-    """Very small TOML subset for Python 3.10: [project] dependencies/scripts and name."""
+    """Very small TOML subset for Python 3.10 (no tomllib).
+
+    Covers [project] name/dependencies/scripts and the keys of a [dependencies]
+    table (Cargo). Quoted strings may contain brackets, e.g. "pkg[extra]".
+    """
     data: dict = {"project": {}}
     m = re.search(r"^name\s*=\s*['\"]([^'\"]+)['\"]", text, re.M)
     if m:
         data["project"]["name"] = m.group(1)
-    m = re.search(r"^dependencies\s*=\s*\[([^\]]*)\]", text, re.M | re.S)
+    table = re.search(r"^\[dependencies\]\s*\n((?:[^\[\n].*\n?)*)", text, re.M)
+    if table:
+        data["dependencies"] = dict.fromkeys(
+            re.findall(r"^([\w.-]+)\s*=", table.group(1), re.M), ""
+        )
+    m = re.search(r"""^dependencies\s*=\s*\[((?:[^\]"']|"[^"]*"|'[^']*')*)\]""", text, re.M | re.S)
     if m:
         data["project"]["dependencies"] = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))
     m = re.search(r"^\[project\.scripts\]\s*\n((?:[^\[\n].*\n?)*)", text, re.M)
