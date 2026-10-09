@@ -112,7 +112,7 @@ The skill lives in `skills/diagram-codebase/`. Pick one of the following.
 ### Personal skill (all your projects)
 
 ```sh
-git clone <this-repo-url> diagram-codebase
+git clone https://github.com/ompug/diagram-codebase.git diagram-codebase
 mkdir -p ~/.claude/skills
 ln -s "$(pwd)/diagram-codebase/skills/diagram-codebase" ~/.claude/skills/diagram-codebase
 # or copy instead of symlinking:
