@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: python -m pip install "ruff>=0.6"
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install pytest
+        run: python -m pip install pytest
+      - name: Run tests
+        run: python -m pytest -q
+
+  mermaid-parser:
+    name: Mermaid parser check (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: skills/diagram-codebase/tools/mermaid-check/package-lock.json
+      - name: Install mermaid-check
+        working-directory: skills/diagram-codebase/tools/mermaid-check
+        run: npm ci
+      - name: Install pytest
+        run: python -m pip install pytest
+      - name: Require the parser check to be available
+        env:
+          PYTHONPATH: skills/diagram-codebase/scripts
+        run: |
+          python - <<'EOF'
+          from diagram_codebase.mermaid import parsecheck
+          assert parsecheck.available(), parsecheck.unavailable_reason()
+          print("mermaid-check available")
+          EOF
+      - name: Run parser-dependent tests
+        run: python -m pytest -q -rs tests/unit/test_parsecheck.py tests/unit/test_mermaid_build.py
+
+  package:
+    name: Package validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate .claude-plugin/plugin.json
+        run: |
+          python - <<'EOF'
+          import json, sys
+          data = json.load(open(".claude-plugin/plugin.json", encoding="utf-8"))
+          missing = [k for k in ("name", "version") if not isinstance(data.get(k), str) or not data[k]]
+          if missing:
+              sys.exit(f"plugin.json missing: {', '.join(missing)}")
+          print(f"plugin.json ok: {data['name']} {data['version']}")
+          EOF
+      - name: Validate SKILL.md frontmatter
+        run: |
+          python - <<'EOF'
+          import re, sys
+          text = open("skills/diagram-codebase/SKILL.md", encoding="utf-8").read()
+          m = re.match(r"---\n(.*?)\n---\n", text, re.S)
+          if not m:
+              sys.exit("SKILL.md: no '---' frontmatter block at the top")
+          keys = {}
+          for line in m.group(1).splitlines():
+              km = re.match(r"([A-Za-z0-9_-]+):\s*(.*)$", line)
+              if km:
+                  keys[km.group(1)] = km.group(2).strip()
+          for key in ("name", "description"):
+              if not keys.get(key):
+                  sys.exit(f"SKILL.md frontmatter: '{key}' missing or empty")
+          if keys["name"] != "diagram-codebase":
+              sys.exit(f"SKILL.md frontmatter: unexpected name {keys['name']!r}")
+          print("SKILL.md frontmatter ok")
+          EOF
+      - name: Check no generated directories are committed
+        run: |
+          bad=$(git ls-files | grep -E '(^|/)(node_modules|\.diagram-codebase)/' || true)
+          if [ -n "$bad" ]; then
+            echo "These paths must not be committed:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "no node_modules or .diagram-codebase committed"
